@@ -69,6 +69,7 @@ struct
 {
   std::bitset<32> inputs;
   SemaphoreHandle_t mutex;
+  int knob3Rotation; // volume control: valid range 0 to 8
 
   std::bitset<32> get_inputs()
   {
@@ -93,6 +94,9 @@ void sampleISR()
   static uint32_t phaseAcc = 0;
   phaseAcc += currentStepSize;
   int32_t Vout = (phaseAcc >> 24) - 128;
+  int volume = __atomic_load_n(&sysState.knob3Rotation, __ATOMIC_RELAXED);
+  // Right-shift the waveform by (8 - volume) for simple log taper volume control
+  Vout = Vout >> (8 - volume);
   analogWrite(OUTR_PIN, Vout + 128);
 }
 
@@ -143,13 +147,18 @@ void scanKeysTask(void *pvParameters)
   TickType_t xLastWakeTime = xTaskGetTickCount();
   uint32_t localStepSize = 0;
 
+  // Static variables for knob 3 decoding
+  static uint8_t prevKnob3 = 0; // previous state bits {B,A} as a 2‑bit number
+  static int lastKnobSign = 0;  // last valid rotation direction
+  static bool firstRun = true;  // to initialize prevKnob3 on first iteration
+
   while (1)
   {
     vTaskDelayUntil(&xLastWakeTime, xFrequency);
 
     std::bitset<32> inputsTemp;
-    // Scan rows 0 to 2 (12 keys total)
-    for (uint8_t row = 0; row < 3; row++)
+    // Scan rows 0 to 2 (12 keys total) and row3 for knob 3 rotation.
+    for (uint8_t row = 0; row < 4; row++)
     {
       setRow(row);
       delayMicroseconds(3);
@@ -174,15 +183,44 @@ void scanKeysTask(void *pvParameters)
     }
     // Atomically update currentStepSize.
     __atomic_store_n(&currentStepSize, localStepSize, __ATOMIC_RELAXED);
+
+    // --- Decode knob 3 ---
+    // Knob 3 inputs are in row 3, columns 0 (A) and 1 (B)
+    // Build a 2‑bit value: bit0 = A, bit1 = B
+    uint8_t currentKnob3 = ((sysState.get_inputs()[13] ? 1 : 0) << 1) | (sysState.get_inputs()[12] ? 1 : 0);
+    // On the first run, initialize prevKnob3.
+    if (firstRun)
+    {
+      prevKnob3 = currentKnob3;
+      firstRun = false;
+    }
+    int delta = 0;
+    // Only update rotation when A (bit0) changes.
+    if (prevKnob3 == 0 && currentKnob3 == 1 || prevKnob3 == 3 && currentKnob3 == 2)
+      delta = 1;
+    else if (prevKnob3 == 1 && currentKnob3 == 0 || prevKnob3 == 2 && currentKnob3 == 3)
+      delta = -1;
+    lastKnobSign = delta;
+    // If both bits changed (impossible transition), assume same direction as last valid.
+    if (prevKnob3 == 0 && currentKnob3 == 3 || prevKnob3 == 3 && currentKnob3 == 0 || prevKnob3 == 1 && currentKnob3 == 2 || prevKnob3 == 2 && currentKnob3 == 1)
+      delta = lastKnobSign;
+    // Update knob rotation using atomic store.
+    int tempRotation = __atomic_load_n(&sysState.knob3Rotation, __ATOMIC_RELAXED);
+    int newRotation = tempRotation + delta;
+    newRotation = max(min(newRotation, 8), 0);
+    __atomic_store_n(&sysState.knob3Rotation, newRotation, __ATOMIC_RELAXED);
+    prevKnob3 = currentKnob3;
   }
 }
 
 // Task to update the display.
-void displayUpdateTask(void * pvParameters) {
+void displayUpdateTask(void *pvParameters)
+{
   const TickType_t xFrequency = 100 / portTICK_PERIOD_MS;
   TickType_t xLastWakeTime = xTaskGetTickCount();
 
-  while (1) {
+  while (1)
+  {
     vTaskDelayUntil(&xLastWakeTime, xFrequency);
 
     u8g2.clearBuffer();
@@ -195,6 +233,11 @@ void displayUpdateTask(void * pvParameters) {
     // Also display lower 12 bits of the key matrix input.
     u8g2.setCursor(2, 20);
     u8g2.print(sysState.get_inputs().to_ulong() & 0xFFF, HEX);
+    // Also display knob 3 rotation on the next line.
+    int knob3 = __atomic_load_n(&sysState.knob3Rotation, __ATOMIC_RELAXED);
+    u8g2.setCursor(2, 30);
+    u8g2.print("Knob3: ");
+    u8g2.print(knob3);
     u8g2.sendBuffer();
 
     digitalToggle(LED_BUILTIN); // Blink LED to indicate timing
@@ -252,6 +295,7 @@ void setup()
 
   // Create a mutex to protect the shared sysState.inputs.
   sysState.mutex = xSemaphoreCreateMutex();
+  sysState.knob3Rotation = 8; // maximum volume (no attenuation)
 
   // Start FreeRTOS scheduler.
   vTaskStartScheduler();

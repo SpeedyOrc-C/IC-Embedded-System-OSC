@@ -1,6 +1,9 @@
 #include <Arduino.h>
+#include <STM32FreeRTOS.h>
 #include <U8g2lib.h>
 #include <bitset>
+#include <iostream>
+#include <string>
 
 // Constants
 const uint32_t interval = 100; // Display update interval
@@ -38,18 +41,18 @@ const int HKOE_BIT = 6;
 // S = (2^32 * f) / 22000, where f = 440 * 2^((i - 9)/12)
 // These values are approximate.
 const uint32_t stepSizes[] = {
-  51043965,  // Note 0: ~261.6 Hz
-  54176000,  // Note 1: ~277.4 Hz
-  57309000,  // Note 2: ~293.3 Hz
-  60752000,  // Note 3: ~311.1 Hz
-  64300000,  // Note 4: ~329.6 Hz
-  68154000,  // Note 5: ~349.3 Hz
-  72130000,  // Note 6: ~369.6 Hz
-  76490000,  // Note 7: ~391.9 Hz
-  81000000,  // Note 8: ~415.3 Hz
-  85900000,  // Note 9: 440.0 Hz (A)
-  91000000,  // Note 10: ~466.2 Hz
-  96400000   // Note 11: ~493.9 Hz
+    51043965, // Note 0: ~261.6 Hz
+    54176000, // Note 1: ~277.4 Hz
+    57309000, // Note 2: ~293.3 Hz
+    60752000, // Note 3: ~311.1 Hz
+    64300000, // Note 4: ~329.6 Hz
+    68154000, // Note 5: ~349.3 Hz
+    72130000, // Note 6: ~369.6 Hz
+    76490000, // Note 7: ~391.9 Hz
+    81000000, // Note 8: ~415.3 Hz
+    85900000, // Note 9: 440.0 Hz (A)
+    91000000, // Note 10: ~466.2 Hz
+    96400000  // Note 11: ~493.9 Hz
 };
 
 // Global variable to hold the current phase step size.
@@ -59,12 +62,34 @@ volatile uint32_t currentStepSize = 0;
 // Global timer object using TIM1 from stm32duino HardwareTimer library.
 HardwareTimer sampleTimer(TIM1);
 
-
 // Display driver object
 U8G2_SSD1305_128X32_ADAFRUIT_F_HW_I2C u8g2(U8G2_R0);
 
+struct
+{
+  std::bitset<32> inputs;
+  SemaphoreHandle_t mutex;
+
+  std::bitset<32> get_inputs()
+  {
+    std::bitset<32> result;
+    xSemaphoreTake(mutex, portMAX_DELAY);
+    result = inputs;
+    xSemaphoreGive(mutex);
+    return result;
+  }
+
+  void set_inputs(std::bitset<32> new_inputs)
+  {
+    xSemaphoreTake(mutex, portMAX_DELAY);
+    inputs = new_inputs;
+    xSemaphoreGive(mutex);
+  }
+} sysState;
+
 // C++
-void sampleISR() {
+void sampleISR()
+{
   static uint32_t phaseAcc = 0;
   phaseAcc += currentStepSize;
   int32_t Vout = (phaseAcc >> 24) - 128;
@@ -111,6 +136,71 @@ void setOutMuxBit(const uint8_t bitIdx, const bool value)
   digitalWrite(REN_PIN, LOW);
 }
 
+// Task to scan keys and update global currentStepSize.
+void scanKeysTask(void *pvParameters)
+{
+  const TickType_t xFrequency = 50 / portTICK_PERIOD_MS;
+  TickType_t xLastWakeTime = xTaskGetTickCount();
+  uint32_t localStepSize = 0;
+
+  while (1)
+  {
+    vTaskDelayUntil(&xLastWakeTime, xFrequency);
+
+    std::bitset<32> inputsTemp;
+    // Scan rows 0 to 2 (12 keys total)
+    for (uint8_t row = 0; row < 3; row++)
+    {
+      setRow(row);
+      delayMicroseconds(3);
+      std::bitset<4> rowInputs = readCols();
+      for (uint8_t col = 0; col < 4; col++)
+      {
+        inputsTemp[row * 4 + col] = rowInputs[col];
+      }
+    }
+
+    sysState.set_inputs(inputsTemp);
+
+    // Compute local step size from keys 0-11.
+    localStepSize = 0;
+    for (int note = 0; note < 12; note++)
+    {
+      // Note pressed when key reads logic 0.
+      if (!sysState.get_inputs()[note])
+      {
+        localStepSize = stepSizes[note];
+      }
+    }
+    // Atomically update currentStepSize.
+    __atomic_store_n(&currentStepSize, localStepSize, __ATOMIC_RELAXED);
+  }
+}
+
+// Task to update the display.
+void displayUpdateTask(void * pvParameters) {
+  const TickType_t xFrequency = 100 / portTICK_PERIOD_MS;
+  TickType_t xLastWakeTime = xTaskGetTickCount();
+
+  while (1) {
+    vTaskDelayUntil(&xLastWakeTime, xFrequency);
+
+    u8g2.clearBuffer();
+    u8g2.setFont(u8g2_font_ncenB08_tr);
+    // Display current phase step size (read atomically)
+    char buf[12];
+    uint32_t displayStepSize = __atomic_load_n(&currentStepSize, __ATOMIC_RELAXED);
+    sprintf(buf, "%lu", displayStepSize);
+    u8g2.drawStr(2, 10, buf);
+    // Also display lower 12 bits of the key matrix input.
+    u8g2.setCursor(2, 20);
+    u8g2.print(sysState.get_inputs().to_ulong() & 0xFFF, HEX);
+    u8g2.sendBuffer();
+
+    digitalToggle(LED_BUILTIN); // Blink LED to indicate timing
+  }
+}
+
 void setup()
 {
   // put your setup code here, to run once:
@@ -147,53 +237,73 @@ void setup()
   sampleTimer.setOverflow(22000, HERTZ_FORMAT);
   sampleTimer.attachInterrupt(sampleISR);
   sampleTimer.resume();
+
+  TaskHandle_t scanKeysHandle = NULL;
+  xTaskCreate(
+      scanKeysTask,     /* Function that implements the task */
+      "scanKeys",       /* Text name for the task */
+      64,               /* Stack size in words, not bytes */
+      NULL,             /* Parameter passed into the task */
+      1,                /* Task priority */
+      &scanKeysHandle); /* Pointer to store the task handle */
+
+  TaskHandle_t displayHandle = NULL;
+  xTaskCreate(displayUpdateTask, "display", 256, NULL, 1, &displayHandle);
+
+  // Create a mutex to protect the shared sysState.inputs.
+  sysState.mutex = xSemaphoreCreateMutex();
+
+  // Start FreeRTOS scheduler.
+  vTaskStartScheduler();
 }
 
 void loop()
 {
   // put your main code here, to run repeatedly:
-  static uint32_t next = millis();
-  static uint32_t count = 0;
+  // static uint32_t next = millis();
+  // static uint32_t count = 0;
 
-  while (millis() < next)
-    ; // Wait for next interval
+  // while (millis() < next)
+  //   ; // Wait for next interval
 
-  next += interval;
+  // next += interval;
 
-  std::bitset<32> inputs; // 32-bit vector to store all key states
+  // std::bitset<32> inputs; // 32-bit vector to store all key states
 
-  // Scan the key matrix rows 0 to 2 (only 12 keys)
-  for (uint8_t row = 0; row < 3; row++)
-  {
-    setRow(row);
-    delayMicroseconds(3);
-    std::bitset<4> rowInputs = readCols();
-    for (uint8_t col = 0; col < 4; col++)
-    {
-      inputs[row * 4 + col] = rowInputs[col];
-    }
-  }
+  // // Scan the key matrix rows 0 to 2 (only 12 keys)
+  // for (uint8_t row = 0; row < 3; row++)
+  // {
+  //   setRow(row);
+  //   delayMicroseconds(3);
+  //   std::bitset<4> rowInputs = readCols();
+  //   for (uint8_t col = 0; col < 4; col++)
+  //   {
+  //     inputs[row * 4 + col] = rowInputs[col];
+  //   }
+  // }
 
-  // Use a local variable to compute the step size.
-  uint32_t localStepSize = 0;
-  for (int note = 0; note < 12; note++) {
-    // Keys read as logic 0 when pressed.
-    if (!inputs[note]) {
-      localStepSize = stepSizes[note];
-    }
-  }
-  // Atomically update the global currentStepSize.
-  __atomic_store_n(&currentStepSize, localStepSize, __ATOMIC_RELAXED);
+  // // Use a local variable to compute the step size.
+  // uint32_t localStepSize = 0;
+  // for (int note = 0; note < 12; note++) {
+  //   // Keys read as logic 0 when pressed.
+  //   if (!inputs[note]) {
+  //     localStepSize = stepSizes[note];
+  //   }
+  // }
+  // // Atomically update the global currentStepSize.
+  // __atomic_store_n(&currentStepSize, localStepSize, __ATOMIC_RELAXED);
 
   // Update display
-  u8g2.clearBuffer();                   // clear the internal memory
-  u8g2.setFont(u8g2_font_ncenB08_tr);   // choose a suitable font
-  u8g2.drawStr(2, 10, "Helllo World!"); // write something to the internal memory
-  u8g2.setCursor(2, 20);
-  u8g2.print(inputs.to_ulong() & 0xFFF, HEX);
+  // u8g2.clearBuffer();                 // clear the internal memory
+  // u8g2.setFont(u8g2_font_ncenB08_tr); // choose a suitable font
+  // // u8g2.drawStr(2, 10, "Helllo World!"); // write something to the internal memory
+  // std::string strValue = std::to_string(currentStepSize);
+  // u8g2.drawStr(2, 10, strValue.c_str()); // write something to the internal memory
+  // u8g2.setCursor(2, 20);
+  // u8g2.print(inputs.to_ulong() & 0xFFF, HEX);
 
-  u8g2.sendBuffer(); // transfer internal memory to the display
+  // u8g2.sendBuffer(); // transfer internal memory to the display
 
-  // Toggle LED
-  digitalToggle(LED_BUILTIN);
+  // // Toggle LED
+  // digitalToggle(LED_BUILTIN);
 }

@@ -4,6 +4,57 @@
 #include <bitset>
 #include <iostream>
 #include <string>
+#include <ES_CAN.h>
+
+volatile uint8_t TX_Message[8] = {0}; // Outgoing CAN message
+volatile uint8_t RX_Message[8] = {0}; // Latest received CAN message
+
+QueueHandle_t msgInQ;               // Queue for received messages
+QueueHandle_t msgOutQ;              // Queue for messages to transmit
+SemaphoreHandle_t CAN_TX_Semaphore; // Counting semaphore for CAN TX mailboxes
+
+// Forward declarations of new task functions
+void decodeTask(void *pvParameters)
+{
+  uint8_t msgIn[8];
+  while (1)
+  {
+    xQueueReceive(msgInQ, msgIn, portMAX_DELAY);
+    // Copy the received message to RX_Message (no mutex for testing)
+    for (int i = 0; i < 8; i++)
+    {
+      RX_Message[i] = msgIn[i];
+    }
+    // (Optionally, process the message to play notes.)
+  }
+}
+
+void CAN_TX_Task(void *pvParameters)
+{
+  uint8_t msgOut[8];
+  while (1)
+  {
+    xQueueReceive(msgOutQ, msgOut, portMAX_DELAY);
+    // Wait for a mailbox slot to be free.
+    xSemaphoreTake(CAN_TX_Semaphore, portMAX_DELAY);
+    CAN_TX(0x123, msgOut);
+  }
+}
+
+// CAN receive ISR – very short, just reads message and pushes it onto msgInQ.
+void CAN_RX_ISR(void)
+{
+  uint8_t RX_Message_ISR[8];
+  uint32_t id;
+  CAN_RX(id, RX_Message_ISR);
+  xQueueSendFromISR(msgInQ, RX_Message_ISR, NULL);
+}
+
+// CAN transmit ISR – gives the semaphore each time a mailbox slot is freed.
+void CAN_TX_ISR(void)
+{
+  xSemaphoreGiveFromISR(CAN_TX_Semaphore, NULL);
+}
 
 // Constants
 const uint32_t interval = 100; // Display update interval
@@ -184,6 +235,29 @@ void scanKeysTask(void *pvParameters)
     // Atomically update currentStepSize.
     __atomic_store_n(&currentStepSize, localStepSize, __ATOMIC_RELAXED);
 
+    // Within scanKeysTask() — after scanning the key matrix.
+    static std::bitset<32> prevInputs; // static variable to hold the previous key states
+
+    // Example for keys 0 to 11:
+    for (int note = 0; note < 12; note++)
+    {
+      bool currPressed = !sysState.get_inputs()[note]; // pressed if logic 0
+      bool prevPressed = prevInputs[note];
+      if (currPressed != prevPressed)
+      { // state changed
+        if (currPressed)
+          TX_Message[0] = 'P';
+        else
+          TX_Message[0] = 'R';
+        TX_Message[1] = 4;    // For example, fixed octave 4
+        TX_Message[2] = note; // Note number
+        // Send TX_Message via the transmit queue:
+        xQueueSend(msgOutQ, (void*)TX_Message, portMAX_DELAY);
+      }
+      // Save the current state.
+      prevInputs[note] = currPressed;
+    }
+
     // --- Decode knob 3 ---
     // Knob 3 inputs are in row 3, columns 0 (A) and 1 (B)
     // Build a 2‑bit value: bit0 = A, bit1 = B
@@ -238,6 +312,11 @@ void displayUpdateTask(void *pvParameters)
     u8g2.setCursor(2, 30);
     u8g2.print("Knob3: ");
     u8g2.print(knob3);
+    // Display latest received CAN message.
+    u8g2.setCursor(66, 30);
+    u8g2.print((char)RX_Message[0]);
+    u8g2.print(RX_Message[1]);
+    u8g2.print(RX_Message[2]);
     u8g2.sendBuffer();
 
     digitalToggle(LED_BUILTIN); // Blink LED to indicate timing
@@ -281,6 +360,20 @@ void setup()
   sampleTimer.attachInterrupt(sampleISR);
   sampleTimer.resume();
 
+  // --- CAN bus initialisation ---
+  CAN_Init(true);             // Loopback mode for testing
+  setCANFilter(0x123, 0x7FF); // Only accept messages with ID 0x123
+  CAN_Start();
+  // Create queues. Each item is 8 bytes.
+  msgInQ = xQueueCreate(36, 8);
+  msgOutQ = xQueueCreate(36, 8);
+  // Create counting semaphore for 3 mailbox slots.
+  CAN_TX_Semaphore = xSemaphoreCreateCounting(3, 3);
+  // Register CAN TX and RX ISRs.
+  CAN_RegisterTX_ISR(CAN_TX_ISR);
+  CAN_RegisterRX_ISR(CAN_RX_ISR);
+
+  // Create FreeRTOS tasks.
   TaskHandle_t scanKeysHandle = NULL;
   xTaskCreate(
       scanKeysTask,     /* Function that implements the task */
@@ -293,9 +386,15 @@ void setup()
   TaskHandle_t displayHandle = NULL;
   xTaskCreate(displayUpdateTask, "display", 256, NULL, 1, &displayHandle);
 
+  TaskHandle_t decodeHandle = NULL;
+  xTaskCreate(decodeTask, "decode", 128, NULL, 1, &decodeHandle);
+
+  TaskHandle_t canTxHandle = NULL;
+  xTaskCreate(CAN_TX_Task, "CAN_TX", 128, NULL, 1, &canTxHandle);
+
   // Create a mutex to protect the shared sysState.inputs.
   sysState.mutex = xSemaphoreCreateMutex();
-  sysState.knob3Rotation = 8; // maximum volume (no attenuation)
+  sysState.knob3Rotation = 1; // maximum volume (no attenuation)
 
   // Start FreeRTOS scheduler.
   vTaskStartScheduler();

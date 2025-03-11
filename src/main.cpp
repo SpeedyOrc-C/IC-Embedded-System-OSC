@@ -87,6 +87,19 @@ const int DRST_BIT = 4;
 const int HKOW_BIT = 5;
 const int HKOE_BIT = 6;
 
+// define the columns for the knobs
+const uint KNOB_A[4]{18, 16, 14, 12};
+const int KNOB_B[4]{19, 17, 15, 13};
+
+const int KNOB_0_MIN = 0;
+const int KNOB_0_MAX = 8;
+const int KNOB_1_MIN = 0;
+const int KNOB_1_MAX = 8;
+const int KNOB_2_MIN = 0;
+const int KNOB_2_MAX = 8;
+const int KNOB_3_MIN = 0;
+const int KNOB_3_MAX = 8;
+
 // step size definition
 // Update the phase step sizes for 12 notes.
 // S = (2^32 * f) / 22000, where f = 440 * 2^((i - 9)/12)
@@ -116,41 +129,6 @@ HardwareTimer sampleTimer(TIM1);
 // Display driver object
 U8G2_SSD1305_128X32_ADAFRUIT_F_HW_I2C u8g2(U8G2_R0);
 
-struct
-{
-  std::bitset<32> inputs;
-  SemaphoreHandle_t mutex;
-  int knob3Rotation; // volume control: valid range 0 to 8
-
-  std::bitset<32> get_inputs()
-  {
-    std::bitset<32> result;
-    xSemaphoreTake(mutex, portMAX_DELAY);
-    result = inputs;
-    xSemaphoreGive(mutex);
-    return result;
-  }
-
-  void set_inputs(std::bitset<32> new_inputs)
-  {
-    xSemaphoreTake(mutex, portMAX_DELAY);
-    inputs = new_inputs;
-    xSemaphoreGive(mutex);
-  }
-} sysState;
-
-// C++
-void sampleISR()
-{
-  static uint32_t phaseAcc = 0;
-  phaseAcc += currentStepSize;
-  int32_t Vout = (phaseAcc >> 24) - 128;
-  int volume = __atomic_load_n(&sysState.knob3Rotation, __ATOMIC_RELAXED);
-  // Right-shift the waveform by (8 - volume) for simple log taper volume control
-  Vout = Vout >> (8 - volume);
-  analogWrite(OUTR_PIN, Vout + 128);
-}
-
 void setRow(uint8_t rowIdx)
 {
   // Disable the row select enable pin to prevent glitches.
@@ -178,6 +156,60 @@ std::bitset<4> readCols()
   return result;
 }
 
+class knob
+{
+private:
+  volatile uint _prevKnob = 0;
+  volatile uint _knobRotation = 0;
+  volatile int _lastKnobSign = 0;
+  int _minimum;
+  int _maximum;
+  int _A_column;
+
+public:
+  knob(int minimum, int maximum, uint A_column, int current_rotation) : _minimum(minimum), _maximum(maximum), _A_column(A_column)
+  {
+    setRow(3);
+    delayMicroseconds(3);
+    std::bitset<4> rowInputs = readCols();
+    __atomic_store_n(&_knobRotation, max(min(current_rotation, _maximum), _minimum), __ATOMIC_RELAXED);
+    __atomic_store_n(&_prevKnob, (rowInputs[_A_column % 4 + 1] * 2) + rowInputs[_A_column % 4], __ATOMIC_RELAXED);
+  }
+  int read_current()
+  {
+    return _knobRotation;
+  }
+
+  void update_rotate();
+};
+
+struct
+{
+  std::bitset<32> inputs;
+  SemaphoreHandle_t mutex;
+} sysState;
+#define sysMutexAcquire() xSemaphoreTake(sysState.mutex, portMAX_DELAY);
+#define sysMutexRelease() xSemaphoreGive(sysState.mutex);
+
+
+knob knobRotation[4]{
+  knob(KNOB_0_MIN, KNOB_0_MAX, KNOB_A[0], 1),
+  knob(KNOB_1_MIN, KNOB_1_MAX, KNOB_A[1], 1),
+  knob(KNOB_2_MIN, KNOB_2_MAX, KNOB_A[2], 1),
+  knob(KNOB_3_MIN, KNOB_3_MAX, KNOB_A[3], 1)}; // knobs
+// C++
+void sampleISR()
+{
+  static uint32_t phaseAcc = 0;
+  phaseAcc += currentStepSize;
+  int32_t Vout = (phaseAcc >> 24) - 128;
+  int volume = knobRotation[3].read_current();
+  // Right-shift the waveform by (8 - volume) for simple log taper volume control
+  Vout = Vout >> (8 - volume);
+  analogWrite(OUTR_PIN, Vout + 128);
+}
+
+
 // Function to set outputs using key matrix
 void setOutMuxBit(const uint8_t bitIdx, const bool value)
 {
@@ -198,18 +230,13 @@ void scanKeysTask(void *pvParameters)
   TickType_t xLastWakeTime = xTaskGetTickCount();
   uint32_t localStepSize = 0;
 
-  // Static variables for knob 3 decoding
-  static uint8_t prevKnob3 = 0; // previous state bits {B,A} as a 2‑bit number
-  static int lastKnobSign = 0;  // last valid rotation direction
-  static bool firstRun = true;  // to initialize prevKnob3 on first iteration
-
   while (1)
   {
     vTaskDelayUntil(&xLastWakeTime, xFrequency);
 
     std::bitset<32> inputsTemp;
     // Scan rows 0 to 2 (12 keys total) and row3 for knob 3 rotation.
-    for (uint8_t row = 0; row < 4; row++)
+    for (uint8_t row = 0; row < 5; row++)
     {
       setRow(row);
       delayMicroseconds(3);
@@ -220,14 +247,21 @@ void scanKeysTask(void *pvParameters)
       }
     }
 
-    sysState.set_inputs(inputsTemp);
+    sysMutexAcquire();
+    sysState.inputs = inputsTemp;
+    sysMutexRelease();
 
     // Compute local step size from keys 0-11.
     localStepSize = 0;
     for (int note = 0; note < 12; note++)
     {
       // Note pressed when key reads logic 0.
-      if (!sysState.get_inputs()[note])
+
+      sysMutexAcquire();
+      std::bitset<32> inputs = sysState.inputs;
+      sysMutexRelease();
+
+      if (!inputs[note])
       {
         localStepSize = stepSizes[note];
       }
@@ -241,7 +275,10 @@ void scanKeysTask(void *pvParameters)
     // Example for keys 0 to 11:
     for (int note = 0; note < 12; note++)
     {
-      bool currPressed = !sysState.get_inputs()[note]; // pressed if logic 0
+      sysMutexAcquire();
+      std::bitset<32> inputs = sysState.inputs;
+      sysMutexRelease();
+      bool currPressed = !inputs[note]; // pressed if logic 0
       bool prevPressed = prevInputs[note];
       if (currPressed != prevPressed)
       { // state changed
@@ -252,38 +289,15 @@ void scanKeysTask(void *pvParameters)
         TX_Message[1] = 4;    // For example, fixed octave 4
         TX_Message[2] = note; // Note number
         // Send TX_Message via the transmit queue:
-        xQueueSend(msgOutQ, (void*)TX_Message, portMAX_DELAY);
+        xQueueSend(msgOutQ, (void *)TX_Message, portMAX_DELAY);
       }
       // Save the current state.
       prevInputs[note] = currPressed;
     }
-
-    // --- Decode knob 3 ---
-    // Knob 3 inputs are in row 3, columns 0 (A) and 1 (B)
-    // Build a 2‑bit value: bit0 = A, bit1 = B
-    uint8_t currentKnob3 = ((sysState.get_inputs()[13] ? 1 : 0) << 1) | (sysState.get_inputs()[12] ? 1 : 0);
-    // On the first run, initialize prevKnob3.
-    if (firstRun)
-    {
-      prevKnob3 = currentKnob3;
-      firstRun = false;
-    }
-    int delta = 0;
-    // Only update rotation when A (bit0) changes.
-    if (prevKnob3 == 0 && currentKnob3 == 1 || prevKnob3 == 3 && currentKnob3 == 2)
-      delta = 1;
-    else if (prevKnob3 == 1 && currentKnob3 == 0 || prevKnob3 == 2 && currentKnob3 == 3)
-      delta = -1;
-    lastKnobSign = delta;
-    // If both bits changed (impossible transition), assume same direction as last valid.
-    if (prevKnob3 == 0 && currentKnob3 == 3 || prevKnob3 == 3 && currentKnob3 == 0 || prevKnob3 == 1 && currentKnob3 == 2 || prevKnob3 == 2 && currentKnob3 == 1)
-      delta = lastKnobSign;
-    // Update knob rotation using atomic store.
-    int tempRotation = __atomic_load_n(&sysState.knob3Rotation, __ATOMIC_RELAXED);
-    int newRotation = tempRotation + delta;
-    newRotation = max(min(newRotation, 8), 0);
-    __atomic_store_n(&sysState.knob3Rotation, newRotation, __ATOMIC_RELAXED);
-    prevKnob3 = currentKnob3;
+    knobRotation[0].update_rotate();
+    knobRotation[1].update_rotate();
+    knobRotation[2].update_rotate();
+    knobRotation[3].update_rotate();
   }
 }
 
@@ -306,14 +320,35 @@ void displayUpdateTask(void *pvParameters)
     u8g2.drawStr(2, 10, buf);
     // Also display lower 12 bits of the key matrix input.
     u8g2.setCursor(2, 20);
-    u8g2.print(sysState.get_inputs().to_ulong() & 0xFFF, HEX);
-    // Also display knob 3 rotation on the next line.
-    int knob3 = __atomic_load_n(&sysState.knob3Rotation, __ATOMIC_RELAXED);
+    sysMutexAcquire();
+    std::bitset<32> inputs = sysState.inputs;
+    sysMutexRelease();
+    u8g2.print(inputs.to_ulong() & 0xFFF, HEX);
+
+    // no need for set up the mutexes
+    int knob = knobRotation[0].read_current();
+    int knob1 = knobRotation[1].read_current();
+    int knob2 = knobRotation[2].read_current();
+    int knob3 = knobRotation[3].read_current();
+
     u8g2.setCursor(2, 30);
-    u8g2.print("Knob3: ");
-    u8g2.print(knob3);
-    // Display latest received CAN message.
+    u8g2.print("0: ");
+    u8g2.print(knob);
+
+    u8g2.setCursor(22, 30);
+    u8g2.print("1: ");
+    u8g2.print(knob1);
+
+    u8g2.setCursor(44, 30);
+    u8g2.print("2: ");
+    u8g2.print(knob2);
+
     u8g2.setCursor(66, 30);
+    u8g2.print("3: ");
+    u8g2.print(knob3);
+
+    // Display latest received CAN message.
+    u8g2.setCursor(88, 30);
     u8g2.print((char)RX_Message[0]);
     u8g2.print(RX_Message[1]);
     u8g2.print(RX_Message[2]);
@@ -361,7 +396,7 @@ void setup()
   sampleTimer.resume();
 
   // --- CAN bus initialisation ---
-  CAN_Init(true);             // Loopback mode for testing
+  CAN_Init(false);            // Loopback mode for testing
   setCANFilter(0x123, 0x7FF); // Only accept messages with ID 0x123
   CAN_Start();
   // Create queues. Each item is 8 bytes.
@@ -394,7 +429,6 @@ void setup()
 
   // Create a mutex to protect the shared sysState.inputs.
   sysState.mutex = xSemaphoreCreateMutex();
-  sysState.knob3Rotation = 1; // maximum volume (no attenuation)
 
   // Start FreeRTOS scheduler.
   vTaskStartScheduler();
@@ -449,4 +483,37 @@ void loop()
 
   // // Toggle LED
   // digitalToggle(LED_BUILTIN);
+}
+
+void knob::update_rotate()
+{
+  {
+    sysMutexAcquire();
+    std::bitset<32> input = sysState.inputs;
+    sysMutexRelease();
+
+    // _B_column will always = _A_column + 1
+    uint8_t currentKnob = (input[_A_column + 1] * 2) + input[_A_column];
+    // in case of possible changing the prevKnob on the way
+    int prevKnob = __atomic_load_n(&_prevKnob, __ATOMIC_RELAXED);
+    __atomic_store_n(&_prevKnob, currentKnob, __ATOMIC_RELAXED);
+
+    int delta = 0;
+    // Only update rotation when A (bit0) changes.
+    if (prevKnob == 0 && currentKnob == 1 || prevKnob == 3 && currentKnob == 2)
+      delta = 1;
+    else if (prevKnob == 1 && currentKnob == 0 || prevKnob == 2 && currentKnob == 3)
+      delta = -1;
+    // If both bits changed (impossible transition), assume same direction as last valid.
+    if (prevKnob == 0 && currentKnob == 3 || prevKnob == 3 && currentKnob == 0 || prevKnob == 1 && currentKnob == 2 || prevKnob == 2 && currentKnob == 1)
+      delta = __atomic_load_n(&_lastKnobSign, __ATOMIC_RELAXED);
+
+    __atomic_store_n(&_lastKnobSign, delta, __ATOMIC_RELAXED);
+  
+    // Update knob rotation using atomic store.
+    int tempRotation = __atomic_load_n(&_knobRotation, __ATOMIC_RELAXED);
+    int newRotation = tempRotation + delta;
+    newRotation = max(min(newRotation, _maximum), _minimum);
+    __atomic_store_n(&_knobRotation, newRotation, __ATOMIC_RELAXED);
+  }
 }

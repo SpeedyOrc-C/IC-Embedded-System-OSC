@@ -23,10 +23,24 @@ enum KeyboardKey
     KeyB = 11,
 };
 
+struct KnobReading
+{
+public:
+    bool a1 : 1;
+    bool b1 : 1;
+    bool a2 : 1;
+    bool b2 : 1;
+    bool a3 : 1;
+    bool b3 : 1;
+    bool a4 : 1;
+    bool b4 : 1;
+};
+
 class KeyPressBuffer
 {
 public:
-    bool keys[MAX_KEYBOARD_KEY_COUNT] = {false, false, false, false, false, false, false, false, false, false, false, false};
+    bool key_reading[MAX_KEYBOARD_KEY_COUNT] = {false, false, false, false, false, false, false, false, false, false, false, false};
+    KnobReading knob_reading = {false, false, false, false, false, false, false, false};
     Osc3x *synthesizer;
 
     KeyPressBuffer(Osc3x *synthesizer)
@@ -36,14 +50,19 @@ public:
 
     void apply_key(KeyboardKey key, bool is_pressed)
     {
-        if (keys[key] != is_pressed)
+        if (key_reading[key] != is_pressed)
         {
-            keys[key] = is_pressed;
+            key_reading[key] = is_pressed;
 
             if (is_pressed)
                 synthesizer->press_note(key);
             else
                 synthesizer->release_note(key);
         }
+    }
+
+    void apply_knob(KnobReading reading)
+    {
+        knob_reading = reading;
     }
 };

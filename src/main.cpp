@@ -56,7 +56,7 @@ void setOutMuxBit(const uint8_t bitIdx, const bool value)
     digitalWrite(REN_PIN, LOW);
 }
 
-bool TestKeyUp(KeyboardKey key)
+bool test_key_up(KeyboardKey key)
 {
     digitalWrite(RA2_PIN, LOW);
 
@@ -119,6 +119,39 @@ bool TestKeyUp(KeyboardKey key)
     return value;
 }
 
+KnobReading test_knobs()
+{
+    KnobReading reading;
+
+    digitalWrite(REN_PIN, HIGH);
+
+    digitalWrite(RA2_PIN, LOW);
+    digitalWrite(RA1_PIN, HIGH);
+    digitalWrite(RA0_PIN, HIGH);
+
+    delayMicroseconds(2);
+
+    reading.a4 = digitalRead(C0_PIN);
+    reading.b4 = digitalRead(C1_PIN);
+    reading.a3 = digitalRead(C2_PIN);
+    reading.b3 = digitalRead(C3_PIN);
+
+    digitalWrite(RA2_PIN, HIGH);
+    digitalWrite(RA1_PIN, LOW);
+    digitalWrite(RA0_PIN, LOW);
+
+    delayMicroseconds(2);
+
+    reading.a2 = digitalRead(C0_PIN);
+    reading.b2 = digitalRead(C1_PIN);
+    reading.a1 = digitalRead(C2_PIN);
+    reading.b1 = digitalRead(C3_PIN);
+
+    digitalWrite(REN_PIN, LOW);
+
+    return reading;
+}
+
 void send_waveform_height()
 {
     const uint32_t height = osc.fetch_waveform_height();
@@ -167,12 +200,14 @@ void setup()
 void loop()
 {
     for (int key = 0; key < MAX_KEYBOARD_KEY_COUNT; key += 1)
-        key_press_buffer.apply_key((KeyboardKey)key, !TestKeyUp((KeyboardKey)key));
+        key_press_buffer.apply_key((KeyboardKey)key, !test_key_up((KeyboardKey)key));
+
+    key_press_buffer.apply_knob(test_knobs());
 
     u8g2.clearBuffer();
 
     for (int key = 0; key <= 11; key += 1)
-        if (!TestKeyUp((KeyboardKey)key))
+        if (key_press_buffer.key_reading[key])
             u8g2.drawBox(key * 4, 12, 4, 4);
 
     for (int i = 0; i < 10; i += 1)

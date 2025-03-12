@@ -1,4 +1,6 @@
+#include <atomic>
 #include <Osc3x.h>
+#include <STM32FreeRTOS.h>
 
 #define MAX_KEYBOARD_KEY_COUNT 12
 
@@ -39,8 +41,7 @@ public:
 class KeyPressBuffer
 {
 public:
-    bool key_reading[MAX_KEYBOARD_KEY_COUNT] = {false, false, false, false, false, false, false, false, false, false, false, false};
-    KnobReading knob_reading = {false, false, false, false, false, false, false, false};
+    std::atomic<bool> key_reading[MAX_KEYBOARD_KEY_COUNT] = {false, false, false, false, false, false, false, false, false, false, false, false};
     Osc3x *synthesizer;
 
     KeyPressBuffer(Osc3x *synthesizer)
@@ -50,19 +51,13 @@ public:
 
     void apply_key(KeyboardKey key, bool is_pressed)
     {
-        if (key_reading[key] != is_pressed)
+        bool not_is_pressed = !is_pressed;
+        if (key_reading[key].compare_exchange_strong(not_is_pressed, is_pressed))
         {
-            key_reading[key] = is_pressed;
-
             if (is_pressed)
                 synthesizer->press_note(key);
             else
                 synthesizer->release_note(key);
         }
-    }
-
-    void apply_knob(KnobReading reading)
-    {
-        knob_reading = reading;
     }
 };

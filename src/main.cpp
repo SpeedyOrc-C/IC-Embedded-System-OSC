@@ -7,6 +7,24 @@
 #include <ES_CAN.h>
 #include <Osc3x.h>
 #include <KeyPressBuffer.h>
+#include <atomic>
+extern "C"{
+#include <game.h>
+}
+
+struct
+{
+  std::bitset<32> inputs;
+  SemaphoreHandle_t mutex;
+  SemaphoreHandle_t rx_meg_mutex;
+  std::atomic<bool> isReceiver = false; // we define the receiver as the rightmost board
+  std::atomic<uint8_t> location = 0;    // 0 leftmost, 1 middle, 2 rightmost
+} sysState;
+#define sysMutexAcquire() xSemaphoreTake(sysState.mutex, portMAX_DELAY);
+#define sysMutexRelease() xSemaphoreGive(sysState.mutex);
+#define sysMutexAcquireRx() xSemaphoreTake(sysState.rx_meg_mutex, portMAX_DELAY);
+#define sysMutexReleaseRx() xSemaphoreGive(sysState.rx_meg_mutex);
+
 
 volatile uint8_t TX_Message[8] = {0}; // Outgoing CAN message
 volatile uint8_t RX_Message[8] = {0}; // Latest received CAN message
@@ -15,6 +33,7 @@ QueueHandle_t msgInQ;               // Queue for received messages
 QueueHandle_t msgOutQ;              // Queue for messages to transmit
 SemaphoreHandle_t CAN_TX_Semaphore; // Counting semaphore for CAN TX mailboxes
 Osc3x osc;
+FxTap fxtap;
 KeyPressBuffer keyBuffer(&osc);
 
 // Forward declarations of new task functions
@@ -25,11 +44,26 @@ void decodeTask(void *pvParameters)
   {
     xQueueReceive(msgInQ, msgIn, portMAX_DELAY);
     // Copy the received message to RX_Message.
+    sysMutexAcquireRx();
     for (int i = 0; i < 8; i++)
     {
       RX_Message[i] = msgIn[i];
     }
-    // (Optionally, process the message to play notes.)
+    sysMutexReleaseRx();
+    if (sysState.isReceiver.load())
+    {
+      if (msgIn[0] == 'P')
+      {
+        //osc.set_note_offset(msgIn[3] * 12); // TODO
+        keyBuffer.apply_key(msgIn[2] + msgIn[3] * 12, true);
+        // osc.press_note(msgIn[2]);
+      }
+      else if (msgIn[0] == 'R')
+      {
+        keyBuffer.apply_key(msgIn[2] + msgIn[3] * 12, false);
+        // osc.release_note(msgIn[2]);
+      }
+    }
   }
 }
 
@@ -122,17 +156,16 @@ const uint32_t stepSizes[] = {
     91000000, // Note 10: ~466.2 Hz
     96400000  // Note 11: ~493.9 Hz
 };
-const float amplitudes[] ={
-  0.0f,
-  0.125f,
-  0.25f,
-  0.375f,
-  0.5f,
-  0.625f,
-  0.75f,
-  0.875f,
-  1.0f
-};
+const float amplitudes[] = {
+    0.0f,
+    0.125f,
+    0.25f,
+    0.375f,
+    0.5f,
+    0.625f,
+    0.75f,
+    0.875f,
+    1.0f};
 
 // Global variable to hold the current phase step size.
 volatile uint32_t currentStepSize = 0;
@@ -198,26 +231,33 @@ public:
   bool update_rotate();
 };
 
-struct
-{
-  std::bitset<32> inputs;
-  SemaphoreHandle_t mutex;
-  SemaphoreHandle_t rx_meg_mutex;
-} sysState;
-#define sysMutexAcquire() xSemaphoreTake(sysState.mutex, portMAX_DELAY);
-#define sysMutexRelease() xSemaphoreGive(sysState.mutex);
-
 knob knobRotation[4]{
     knob(KNOB_0_MIN, KNOB_0_MAX, KNOB_A[0], 1),
     knob(KNOB_1_MIN, KNOB_1_MAX, KNOB_A[1], 1),
     knob(KNOB_2_MIN, KNOB_2_MAX, KNOB_A[2], 1),
     knob(KNOB_3_MIN, KNOB_3_MAX, KNOB_A[3], 1)}; // knobs
+
+void send_handshake_signal(int signalW, int signalE)
+{
+  setRow(5);
+  delayMicroseconds(3);
+  digitalWrite(OUT_PIN, signalW);
+  delayMicroseconds(3);
+  setRow(6);
+  delayMicroseconds(3);
+  digitalWrite(OUT_PIN, signalE);
+  delayMicroseconds(3);
+}
+
 // C++
 void sampleISR()
 {
   // // Right-shift the waveform by (8 - volume) for simple log taper volume control
   // Vout = Vout >> (8 - volume);
-  analogWrite(OUTR_PIN, (osc.fetch_waveform_height() >> 24));
+  if (sysState.isReceiver.load())
+  {
+    analogWrite(OUTR_PIN, (osc.fetch_waveform_height() >> 24));
+  }
 }
 
 // Function to set outputs using key matrix
@@ -233,6 +273,23 @@ void setOutMuxBit(const uint8_t bitIdx, const bool value)
   digitalWrite(REN_PIN, LOW);
 }
 
+inline std::bitset<32> readInput()
+{
+  std::bitset<32> inputsTemp;
+  // Scan rows 0 to 2 (12 keys total) and row3 for knob 3 rotation.
+  for (uint8_t row = 0; row < 8; row++)
+  {
+    setRow(row);
+    delayMicroseconds(3);
+    std::bitset<4> rowInputs = readCols();
+    for (uint8_t col = 0; col < 4; col++)
+    {
+      inputsTemp[row * 4 + col] = rowInputs[col];
+    }
+  }
+  return inputsTemp;
+}
+
 // Task to scan keys and update global currentStepSize.
 void scanKeysTask(void *pvParameters)
 {
@@ -244,43 +301,31 @@ void scanKeysTask(void *pvParameters)
   {
     vTaskDelayUntil(&xLastWakeTime, xFrequency);
 
-    std::bitset<32> inputsTemp;
-    // Scan rows 0 to 2 (12 keys total) and row3 for knob 3 rotation.
-    for (uint8_t row = 0; row < 5; row++)
-    {
-      setRow(row);
-      delayMicroseconds(3);
-      std::bitset<4> rowInputs = readCols();
-      for (uint8_t col = 0; col < 4; col++)
-      {
-        inputsTemp[row * 4 + col] = rowInputs[col];
-      }
-    }
+    std::bitset<32> inputsTemp = readInput();
 
+    // updating the global inputs
     sysMutexAcquire();
     sysState.inputs = inputsTemp;
-    // sysMutexRelease();
-    // // Compute local step size from keys 0-11.
-    // localStepSize = 0;
-    // sysMutexAcquire();
-    // std::bitset<32> inputs = sysState.inputs;
     sysMutexRelease();
-    for (int note = 0; note < 12; note++)
-    {
-      // Note pressed when key reads logic 0.
 
-      if (!inputsTemp[note])
+    // only update if the board is a receiver
+    if (sysState.isReceiver.load())
+    {
+      for (int note = 0; note < 12; note++)
       {
-        // localStepSize = stepSizes[note];
-        keyBuffer.apply_key((KeyboardKey)note, true);
-      }
-      else
-      {
-        keyBuffer.apply_key((KeyboardKey)note, false);
+        // Note pressed when key reads logic 0.
+        if (!inputsTemp[note])
+        {
+          // localStepSize = stepSizes[note];
+          // osc.set_note_offset(sysState.location.load() * 12);
+          keyBuffer.apply_key(note + sysState.location.load() * 12, true);
+        }
+        else
+        {
+          keyBuffer.apply_key(note + sysState.location.load() * 12, false);
+        }
       }
     }
-    // Atomically update currentStepSize.
-    // __atomic_store_n(&currentStepSize, localStepSize, __ATOMIC_RELAXED);
 
     // Within scanKeysTask() — after scanning the key matrix.
     static std::bitset<32> prevInputs; // static variable to hold the previous key states
@@ -301,6 +346,7 @@ void scanKeysTask(void *pvParameters)
           TX_Message[0] = 'R';
         TX_Message[1] = 4;    // For example, fixed octave 4
         TX_Message[2] = note; // Note number
+        TX_Message[3] = sysState.location.load(); // location
         // Send TX_Message via the transmit queue:
         xQueueSend(msgOutQ, (void *)TX_Message, portMAX_DELAY);
       }
@@ -310,9 +356,10 @@ void scanKeysTask(void *pvParameters)
     knobRotation[0].update_rotate();
     knobRotation[1].update_rotate();
     knobRotation[2].update_rotate();
-    if(knobRotation[3].update_rotate()){
+    if (knobRotation[3].update_rotate())
+    {
       int i = (knobRotation[3].read_current());
-      osc.oscillators[0].amplitude.store(amplitudes[i]);
+      osc.oscillators[0].amplitude.store(0.125f * (float) i);
     }
   }
 }
@@ -340,6 +387,8 @@ void displayUpdateTask(void *pvParameters)
     std::bitset<32> inputs = sysState.inputs;
     sysMutexRelease();
     u8g2.print(inputs.to_ulong() & 0xFFF, HEX);
+    u8g2.print(" ");
+    u8g2.print(sysState.location.load());
 
     // no need for set up the mutexes
     int knob = knobRotation[0].read_current();
@@ -362,16 +411,22 @@ void displayUpdateTask(void *pvParameters)
     u8g2.setCursor(66, 30);
     u8g2.print("3: ");
     u8g2.print(knob3);
-    
+
     // Display latest received CAN message.
     u8g2.setCursor(88, 30);
+    sysMutexAcquireRx();
     u8g2.print((char)RX_Message[0]);
     u8g2.print(RX_Message[1]);
     u8g2.print(RX_Message[2]);
+    sysMutexReleaseRx();
     u8g2.sendBuffer();
 
     digitalToggle(LED_BUILTIN); // Blink LED to indicate timing
   }
+}
+
+void loop()
+{
 }
 
 void setup()
@@ -406,15 +461,74 @@ void setup()
   Serial.begin(9600);
   Serial.println("Hello World");
 
+  // --- CAN bus initialisation ---
+  CAN_Init(false);            // Loopback mode for testing
+  setCANFilter(0x123, 0x7FF); // Only accept messages with ID 0x123
+  CAN_RegisterTX_ISR(CAN_TX_ISR);
+  CAN_RegisterRX_ISR(CAN_RX_ISR);
+  CAN_Start();
+
+  // u8g2.clearBuffer();
+  // u8g2.setFont(u8g2_font_ncenB08_tr);
+  // u8g2.setCursor(20, 20);
+  // u8g2.print("detecting boards");
+  // u8g2.sendBuffer();
+
+  std::bitset<32> inputs;
+  std::bitset<1> WestDetect;
+  std::bitset<1> EastDetect;
+
+  send_handshake_signal(1, 1);
+  delay(30);
+
+  delayMicroseconds(10);
+  inputs = readInput();
+  WestDetect[0] = inputs[23];
+  EastDetect[0] = inputs[27];
+
+  if (WestDetect[0])
+  {
+
+    // u8g2.clearBuffer();
+    // u8g2.setFont(u8g2_font_ncenB08_tr);
+    // u8g2.setCursor(20, 20);
+    // u8g2.print("leftmost");
+    // u8g2.print(WestDetect[0]);
+    // u8g2.print(EastDetect[0]);
+    // u8g2.sendBuffer();
+    sysState.location.store(0);
+  }
+  else if (EastDetect[0])
+  {
+
+    // u8g2.clearBuffer();
+    // u8g2.setFont(u8g2_font_ncenB08_tr);
+    // u8g2.setCursor(20, 20);
+    // u8g2.print("rightmost");
+    // u8g2.print(WestDetect[0]);
+    // u8g2.print(EastDetect[0]);
+    // u8g2.sendBuffer();
+    sysState.isReceiver.store(true);
+    sysState.location.store(2);
+  }
+  else
+  {
+    // u8g2.clearBuffer();
+    // u8g2.setFont(u8g2_font_ncenB08_tr);
+    // u8g2.setCursor(20, 20);
+    // u8g2.print("middle");
+    // u8g2.print(WestDetect[0]);
+    // u8g2.print(EastDetect[0]);
+    // u8g2.sendBuffer();
+    sysState.location.store(1);
+  }
+
+  delayMicroseconds(30000);
   // Configure timer to trigger the sampleISR() at 22kHz.
   sampleTimer.setOverflow(22000, HERTZ_FORMAT);
   sampleTimer.attachInterrupt(sampleISR);
   sampleTimer.resume();
 
-  // --- CAN bus initialisation ---
-  CAN_Init(true);            // Loopback mode for testing
-  setCANFilter(0x123, 0x7FF); // Only accept messages with ID 0x123
-  CAN_Start();
   // Create queues. Each item is 8 bytes.
   msgInQ = xQueueCreate(36, 8);
   msgOutQ = xQueueCreate(36, 8);
@@ -434,8 +548,10 @@ void setup()
       1,                /* Task priority */
       &scanKeysHandle); /* Pointer to store the task handle */
 
+  // TaskHandle_t displayHandle = NULL, 1, &displayHandle);
   TaskHandle_t displayHandle = NULL;
   xTaskCreate(displayUpdateTask, "display", 256, NULL, 1, &displayHandle);
+
 
   TaskHandle_t decodeHandle = NULL;
   xTaskCreate(decodeTask, "decode", 128, NULL, 1, &decodeHandle);
@@ -451,57 +567,6 @@ void setup()
 
   // Start FreeRTOS scheduler.
   vTaskStartScheduler();
-}
-
-void loop()
-{
-  // put your main code here, to run repeatedly:
-  // static uint32_t next = millis();
-  // static uint32_t count = 0;
-
-  // while (millis() < next)
-  //   ; // Wait for next interval
-
-  // next += interval;
-
-  // std::bitset<32> inputs; // 32-bit vector to store all key states
-
-  // // Scan the key matrix rows 0 to 2 (only 12 keys)
-  // for (uint8_t row = 0; row < 3; row++)
-  // {
-  //   setRow(row);
-  //   delayMicroseconds(3);
-  //   std::bitset<4> rowInputs = readCols();
-  //   for (uint8_t col = 0; col < 4; col++)
-  //   {
-  //     inputs[row * 4 + col] = rowInputs[col];
-  //   }
-  // }
-
-  // // Use a local variable to compute the step size.
-  // uint32_t localStepSize = 0;
-  // for (int note = 0; note < 12; note++) {
-  //   // Keys read as logic 0 when pressed.
-  //   if (!inputs[note]) {
-  //     localStepSize = stepSizes[note];
-  //   }
-  // }
-  // // Atomically update the global currentStepSize.
-  // __atomic_store_n(&currentStepSize, localStepSize, __ATOMIC_RELAXED);
-
-  // Update display
-  // u8g2.clearBuffer();                 // clear the internal memory
-  // u8g2.setFont(u8g2_font_ncenB08_tr); // choose a suitable font
-  // // u8g2.drawStr(2, 10, "Helllo World!"); // write something to the internal memory
-  // std::string strValue = std::to_string(currentStepSize);
-  // u8g2.drawStr(2, 10, strValue.c_str()); // write something to the internal memory
-  // u8g2.setCursor(2, 20);
-  // u8g2.print(inputs.to_ulong() & 0xFFF, HEX);
-
-  // u8g2.sendBuffer(); // transfer internal memory to the display
-
-  // // Toggle LED
-  // digitalToggle(LED_BUILTIN);
 }
 
 bool knob::update_rotate()

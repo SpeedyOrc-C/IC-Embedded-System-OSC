@@ -2,28 +2,28 @@
 #include <Osc3x.h>
 #include <STM32FreeRTOS.h>
 
-#define MAX_KEYBOARD_KEY_COUNT 12
+#define MAX_KEYBOARD_KEY_COUNT 108
 
-enum KeyboardKey
-{
-    KeyC = 0,
-    KeyCs = 1,
-    KeyDf = 1,
-    KeyD = 2,
-    KeyDs = 3,
-    KeyEf = 3,
-    KeyE = 4,
-    KeyF = 5,
-    KeyFs = 6,
-    KeyGf = 6,
-    KeyG = 7,
-    KeyGs = 8,
-    KeyAf = 8,
-    KeyA = 9,
-    KeyAs = 10,
-    KeyBf = 10,
-    KeyB = 11,
-};
+// enum KeyboardKey
+// {
+//     KeyC = 0,
+//     KeyCs = 1,
+//     KeyDf = 1,
+//     KeyD = 2,
+//     KeyDs = 3,
+//     KeyEf = 3,
+//     KeyE = 4,
+//     KeyF = 5,
+//     KeyFs = 6,
+//     KeyGf = 6,
+//     KeyG = 7,
+//     KeyGs = 8,
+//     KeyAf = 8,
+//     KeyA = 9,
+//     KeyAs = 10,
+//     KeyBf = 10,
+//     KeyB = 11,
+// };
 
 struct KnobReading
 {
@@ -49,7 +49,7 @@ public:
         this->synthesizer = synthesizer;
     }
 
-    void apply_key(KeyboardKey key, bool is_pressed)
+    void apply_key(int key, bool is_pressed)
     {
         bool not_is_pressed = !is_pressed;
         if (key_reading[key].compare_exchange_strong(not_is_pressed, is_pressed))

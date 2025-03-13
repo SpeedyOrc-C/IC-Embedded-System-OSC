@@ -227,6 +227,14 @@ public:
         return false;
     }
 
+    void set_note_offset(int32_t note_offset)
+    {
+        for (auto &oscillator: oscillators)
+        {
+            oscillator.note_offset.store(note_offset);
+        }
+    }
+
     Osc3x()
     {
         oscillators[0].amplitude.store(0.2f);

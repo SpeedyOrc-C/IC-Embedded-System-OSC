@@ -29,11 +29,10 @@ struct
 volatile uint8_t TX_Message[8] = {0}; // Outgoing CAN message
 volatile uint8_t RX_Message[8] = {0}; // Latest received CAN message
 
-QueueHandle_t msgInQ;               // Queue for received messages
-QueueHandle_t msgOutQ;              // Queue for messages to transmit
+QueueHandle_t msgInQ = xQueueCreate(36, 8);               // Queue for received messages
+QueueHandle_t msgOutQ = xQueueCreate(36, 8);              // Queue for messages to transmit
 SemaphoreHandle_t CAN_TX_Semaphore; // Counting semaphore for CAN TX mailboxes
 Osc3x osc;
-FxTap fxtap;
 KeyPressBuffer keyBuffer(&osc);
 
 // Forward declarations of new task functions
@@ -85,6 +84,8 @@ void CAN_RX_ISR(void)
   uint8_t RX_Message_ISR[8];
   uint32_t id;
   CAN_RX(id, RX_Message_ISR);
+  Serial.println("RX :");
+  Serial.println((char) RX_Message_ISR[0]);
   xQueueSendFromISR(msgInQ, RX_Message_ISR, NULL);
 }
 
@@ -425,6 +426,143 @@ void displayUpdateTask(void *pvParameters)
   }
 }
 
+uint8_t autoDetection(){
+  uint8_t msgOut[8] = {0};  //message out
+  uint8_t msgIn[8] = {0};  //message in
+  
+  std::bitset<32> inputs;
+  std::bitset<1> WestDetect;
+  std::bitset<1> EastDetect;
+
+  for(int i = 0; i < 10; i++) {
+    send_handshake_signal(1,1);
+    delayMicroseconds(30000);
+  }
+  
+
+  inputs = readInput();
+  WestDetect[0] = inputs[23];
+  EastDetect[0] = inputs[27];
+  
+  u8g2.clearBuffer();
+  u8g2.setFont(u8g2_font_ncenB08_tr);
+  u8g2.setCursor(20, 20);
+  u8g2.print("loading");
+  u8g2.print(!WestDetect[0]);
+  u8g2.print(!EastDetect[0]);
+  u8g2.sendBuffer();
+
+  if (WestDetect[0])
+  {
+    Serial.println("mainboard");
+    // u8g2.clearBuffer();
+    // u8g2.setFont(u8g2_font_ncenB08_tr);
+    // u8g2.setCursor(20, 20);
+    // u8g2.print("leftmost");
+    // Signal.println(WestDetect[0]);
+    // u8g2.print(EastDetect[0]);
+    // u8g2.sendBuffer();
+    // sysState.location.store(0);
+
+    // if not the only board
+    if(!EastDetect[0]){
+      Serial.println("it is not the only board.");
+
+      msgOut[0] = 'C';
+      msgOut[1] = 0;    // For example, fixed octave 4
+      // Send TX_Message via the transmit queue:
+      CAN_TX(0x123, msgOut);
+      Serial.println("submitted C 0 in CAN");
+      // delay(200);
+      delay(300);
+      for(int i = 0; i < 10; i++){
+        send_handshake_signal(0, 0);
+        delay(30);
+      }
+      Serial.println("disabled the east west");
+      delay(300);
+    } else{
+      return 0;
+    }
+    while(true){
+      Serial.println("waiting for finishing");
+      uint8_t msgIn[8];
+      uint32_t id;
+      CAN_RX(id, msgIn);
+      if(msgIn[0] == 'D'){
+        break;
+      };
+      delayMicroseconds(30000);
+    }
+    return 0;
+  }
+  else
+  {
+    // u8g2.clearBuffer();
+    // u8g2.setFont(u8g2_font_ncenB08_tr);
+    // u8g2.setCursor(20, 20);
+    // u8g2.print("middle");
+    // u8g2.print(WestDetect[0]);
+    // u8g2.print(EastDetect[0]);
+    // u8g2.sendBuffer();
+    // sysState.location.store(1);
+    
+    do{
+      inputs = readInput();
+      WestDetect[0] = inputs[23];
+      delay(30);
+      Serial.println("detecting");
+    } while(!WestDetect[0]);
+    Serial.println("non detecting west");
+    uint8_t msgIn[8];
+    int id = 0;
+    delay(20);
+    Serial.println(CAN_CheckRXLevel());
+    while(CAN_CheckRXLevel() > 0){
+      uint32_t ID;
+      CAN_RX(ID, msgIn);
+      if(msgIn[0] == 'C'){
+        if (id < msgIn[1]){
+          Serial.println("received C");
+          Serial.println(msgIn[1]);
+          id = msgIn[1];
+        }
+      }
+    }
+    uint8_t msgOut[8];
+    msgOut[0] = 'C';
+    msgOut[1] = id + 1;    // For example, fixed octave 4
+    // Send TX_Message via the transmit queue:
+    CAN_TX(0x123, msgOut);
+    if(EastDetect[0]) {
+      msgOut[0] = 'D';
+      CAN_TX(0x123, msgOut);
+      for(int i = 0; i < 10; i++){
+        send_handshake_signal(0, 0);
+        delay(30);
+      }
+      Serial.println("finished");
+      return id + 1;
+    }
+    for(int i = 0; i < 10; i++){
+      send_handshake_signal(0, 0);
+      delay(30);
+    }
+    while(true){
+      uint8_t msgIn[8];
+      uint32_t id;
+      CAN_RX(id, msgIn);
+      delayMicroseconds(30000);
+      if(msgIn[0] == 'D'){
+        break;
+      };
+    }
+    return id + 1;
+  }
+
+  
+}
+
 void loop()
 {
 }
@@ -464,8 +602,13 @@ void setup()
   // --- CAN bus initialisation ---
   CAN_Init(false);            // Loopback mode for testing
   setCANFilter(0x123, 0x7FF); // Only accept messages with ID 0x123
+  
+  // Create counting semaphore for 3 mailbox slots.
+  CAN_TX_Semaphore = xSemaphoreCreateCounting(3, 3);
+  // Register CAN TX and RX ISRs.
   CAN_RegisterTX_ISR(CAN_TX_ISR);
   CAN_RegisterRX_ISR(CAN_RX_ISR);
+
   CAN_Start();
 
   // u8g2.clearBuffer();
@@ -474,69 +617,19 @@ void setup()
   // u8g2.print("detecting boards");
   // u8g2.sendBuffer();
 
-  std::bitset<32> inputs;
-  std::bitset<1> WestDetect;
-  std::bitset<1> EastDetect;
-
-  send_handshake_signal(1, 1);
-  delay(30);
-
-  delayMicroseconds(10);
-  inputs = readInput();
-  WestDetect[0] = inputs[23];
-  EastDetect[0] = inputs[27];
-
-  if (WestDetect[0])
-  {
-
-    // u8g2.clearBuffer();
-    // u8g2.setFont(u8g2_font_ncenB08_tr);
-    // u8g2.setCursor(20, 20);
-    // u8g2.print("leftmost");
-    // u8g2.print(WestDetect[0]);
-    // u8g2.print(EastDetect[0]);
-    // u8g2.sendBuffer();
-    sysState.location.store(0);
-  }
-  else if (EastDetect[0])
-  {
-
-    // u8g2.clearBuffer();
-    // u8g2.setFont(u8g2_font_ncenB08_tr);
-    // u8g2.setCursor(20, 20);
-    // u8g2.print("rightmost");
-    // u8g2.print(WestDetect[0]);
-    // u8g2.print(EastDetect[0]);
-    // u8g2.sendBuffer();
+  sysState.location.store(autoDetection());
+  send_handshake_signal(1,1);
+  if(sysState.location == 0){
     sysState.isReceiver.store(true);
-    sysState.location.store(2);
   }
-  else
-  {
-    // u8g2.clearBuffer();
-    // u8g2.setFont(u8g2_font_ncenB08_tr);
-    // u8g2.setCursor(20, 20);
-    // u8g2.print("middle");
-    // u8g2.print(WestDetect[0]);
-    // u8g2.print(EastDetect[0]);
-    // u8g2.sendBuffer();
-    sysState.location.store(1);
-  }
-
-  delayMicroseconds(30000);
+  
+  Serial.println("LOCATION:");
+  Serial.println(sysState.location);
   // Configure timer to trigger the sampleISR() at 22kHz.
   sampleTimer.setOverflow(22000, HERTZ_FORMAT);
   sampleTimer.attachInterrupt(sampleISR);
   sampleTimer.resume();
 
-  // Create queues. Each item is 8 bytes.
-  msgInQ = xQueueCreate(36, 8);
-  msgOutQ = xQueueCreate(36, 8);
-  // Create counting semaphore for 3 mailbox slots.
-  CAN_TX_Semaphore = xSemaphoreCreateCounting(3, 3);
-  // Register CAN TX and RX ISRs.
-  CAN_RegisterTX_ISR(CAN_TX_ISR);
-  CAN_RegisterRX_ISR(CAN_RX_ISR);
 
   // Create FreeRTOS tasks.
   TaskHandle_t scanKeysHandle = NULL;

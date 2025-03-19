@@ -8,9 +8,9 @@
 #include <Osc3x.h>
 #include <KeyPressBuffer.h>
 #include <atomic>
-extern "C"{
-#include <game.h>
-}
+// extern "C"{
+// #include <game.h>
+// }
 
 struct
 {
@@ -53,9 +53,7 @@ void decodeTask(void *pvParameters)
     {
       if (msgIn[0] == 'P')
       {
-        //osc.set_note_offset(msgIn[3] * 12); // TODO
         keyBuffer.apply_key(msgIn[2] + msgIn[3] * 12, true);
-        // osc.press_note(msgIn[2]);
       }
       else if (msgIn[0] == 'R')
       {
@@ -133,9 +131,9 @@ const int KNOB_B[4]{19, 17, 15, 13};
 const int KNOB_0_MIN = 0;
 const int KNOB_0_MAX = 8;
 const int KNOB_1_MIN = 0;
-const int KNOB_1_MAX = 8;
+const int KNOB_1_MAX = 3;
 const int KNOB_2_MIN = 0;
-const int KNOB_2_MAX = 8;
+const int KNOB_2_MAX = 4;
 const int KNOB_3_MIN = 0;
 const int KNOB_3_MAX = 8;
 
@@ -235,7 +233,7 @@ public:
 knob knobRotation[4]{
     knob(KNOB_0_MIN, KNOB_0_MAX, KNOB_A[0], 1),
     knob(KNOB_1_MIN, KNOB_1_MAX, KNOB_A[1], 1),
-    knob(KNOB_2_MIN, KNOB_2_MAX, KNOB_A[2], 1),
+    knob(KNOB_2_MIN, KNOB_2_MAX, KNOB_A[2], 2),
     knob(KNOB_3_MIN, KNOB_3_MAX, KNOB_A[3], 1)}; // knobs
 
 void send_handshake_signal(int signalW, int signalE)
@@ -345,8 +343,8 @@ void scanKeysTask(void *pvParameters)
           TX_Message[0] = 'P';
         else
           TX_Message[0] = 'R';
-        TX_Message[1] = 4;    // For example, fixed octave 4
-        TX_Message[2] = note; // Note number
+          TX_Message[1] = 4;    // For example, fixed octave 4
+          TX_Message[2] = note; // Note number
         TX_Message[3] = sysState.location.load(); // location
         // Send TX_Message via the transmit queue:
         xQueueSend(msgOutQ, (void *)TX_Message, portMAX_DELAY);
@@ -355,12 +353,20 @@ void scanKeysTask(void *pvParameters)
       prevInputs[note] = currPressed;
     }
     knobRotation[0].update_rotate();
-    knobRotation[1].update_rotate();
-    knobRotation[2].update_rotate();
-    if (knobRotation[3].update_rotate())
+    if (knobRotation[1].update_rotate())
+    {
+      int i = (knobRotation[1].read_current());
+      osc.oscillators[0].shape.store((WaveShape)i);
+    }
+    if (knobRotation[2].update_rotate()) // octave adjustment
+    {
+      int i = (knobRotation[2].read_current());
+      osc.set_note_offset((i - 2) * 12);
+    }
+    if (knobRotation[3].update_rotate()) // sound adjustment
     {
       int i = (knobRotation[3].read_current());
-      osc.oscillators[0].amplitude.store(0.125f * (float) i);
+      osc.oscillators[0].amplitude.store(0.125f * (float)i);
     }
   }
 }
@@ -600,7 +606,7 @@ void setup()
   Serial.println("Hello World");
 
   // --- CAN bus initialisation ---
-  CAN_Init(false);            // Loopback mode for testing
+  CAN_Init(true);            // Loopback mode for testing
   setCANFilter(0x123, 0x7FF); // Only accept messages with ID 0x123
   
   // Create counting semaphore for 3 mailbox slots.

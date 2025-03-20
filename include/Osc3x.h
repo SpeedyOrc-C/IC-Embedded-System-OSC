@@ -102,14 +102,16 @@ struct Oscillator
 public:
     std::atomic<WaveShape> shape = TriangularWave;
     std::atomic<float> amplitude = 0.0f;
-    std::atomic<int32_t> note_offset = 0;
+    std::atomic<int32_t> note_offset = -12;
     std::atomic<float> phase_offset = 0.0f;
 };
 
 struct Articulation
 {
 public:
-    std::atomic<int32_t> note = 0;
+    std::atomic<int8_t> note = 0;
+    std::atomic<bool> activated = false;
+    std::atomic<int32_t> last_activation_tick = 0;
 };
 
 class Osc3x
@@ -117,6 +119,7 @@ class Osc3x
 public:
     const int32_t sample_rate = 22000;
     std::atomic<int32_t> tick = 0;
+    std::atomic<int32_t> sustain_tick = 0;
 
     Oscillator oscillators[MAX_OSCILLATOR_COUNT];
     Articulation articulations[MAX_ARTICULATION_COUNT];
@@ -127,24 +130,32 @@ public:
 
         int32_t sound_count = 0;
 
-        for (auto &oscillator: oscillators)
+        for (auto &oscillator : oscillators)
         {
-            if(oscillator.amplitude.load() == 0.0f){
+            if (oscillator.amplitude.load() == 0.0f)
                 continue;
-            }
+
             float oscillator_height = 0;
 
-            for (auto &articulation: articulations)
+            for (auto &articulation : articulations)
             {
-                if (articulation.note.load()==0)
+                const int32_t dt = tick - articulation.last_activation_tick.load();
+
+                if (sustain_tick > 0 && dt > sustain_tick)
+                {
+                    articulation.activated.store(false);
+                    continue;
+                }
+
+                if (!articulation.activated.load())
                     continue;
 
                 sound_count += 1;
 
-                const int32_t total_offset = articulation.note.load() - 1 + oscillator.note_offset - 9;
+                const int32_t total_offset = articulation.note.load() + oscillator.note_offset - 9;
                 const float frequency = 440.0f * (total_offset >= 0 ? memo_2_pow_x_div_12[total_offset]
                                                                     : memo_2_pow_neg_x_div_12[-total_offset]);
-                const float phase = (float) tick.load() * frequency / (float) sample_rate + oscillator.phase_offset;
+                const float phase = (float)tick.load() * frequency / (float)sample_rate + oscillator.phase_offset;
                 float phase_int_part;
                 const float phase_decimal_part = modff(phase, &phase_int_part);
 
@@ -152,7 +163,8 @@ public:
 
                 switch (oscillator.shape)
                 {
-                case SquareWave:height = phase_decimal_part < 0.5f ? 1.0f : -1.0f;
+                case SquareWave:
+                    height = phase_decimal_part < 0.5f ? 1.0f : -1.0f;
                     break;
 
                 case TriangularWave:
@@ -164,15 +176,21 @@ public:
                         height = -4.0f * (1.0f - phase_decimal_part);
                     break;
 
-                case SawtoothWave:height = 2.0f * (phase_decimal_part - 0.5f);
+                case SawtoothWave:
+                    height = 2.0f * (phase_decimal_part - 0.5f);
                     break;
 
-                case NoiseWave:height = (float) random() * 2 / (float) UINT32_MAX - 1.0f;
+                case NoiseWave:
+                    height = (float)random() * 2 / (float)UINT32_MAX - 1.0f;
                     break;
 
-                default:height = 0.0f;
+                default:
+                    height = 0.0f;
                     break;
                 }
+
+                if (sustain_tick > 0)
+                    height *= 1.0f - (float)dt / (float)sustain_tick;
 
                 oscillator_height += height;
             }
@@ -183,7 +201,8 @@ public:
         if (sound_count > 0)
         {
             tick.fetch_add(1);
-        } else
+        }
+        else
         {
             tick.store(0);
         }
@@ -194,32 +213,67 @@ public:
         if (total_height < -1.0f)
             total_height = -1.0f;
 
-        return (uint32_t) (((total_height + 1.0f) / 2.0f ) * UINT32_MAX);
+        return (uint32_t)(((total_height + 1.0f) / 2.0f) * UINT32_MAX);
     }
 
-    bool press_note(int32_t note)
+    bool press_note(int8_t note)
     {
-        for (auto &articulation: articulations)
+        if (sustain_tick > 0)
         {
-            if(articulation.note > 0)
-                continue;
-            articulation.note.store(note + 1);
+            Articulation *free_articulation = nullptr;
+
+            for (auto &articulation : articulations)
+            {
+                if (!articulation.activated.load())
+                {
+                    if (free_articulation == nullptr)
+                        free_articulation = &articulation;
+                }
+                else if (articulation.note == note)
+                {
+                    articulation.last_activation_tick.store(tick);
+                    return true;
+                }
+            }
+
+            if (free_articulation == nullptr)
+                return false;
+
+            free_articulation->note.store(note);
+            free_articulation->activated.store(true);
+            free_articulation->last_activation_tick.store(tick);
 
             return true;
         }
+        else
+        {
+            for (auto &articulation : articulations)
+            {
+                if (articulation.activated.load())
+                    continue;
 
-        return false;
+                articulation.note.store(note);
+                articulation.activated.store(true);
+                articulation.last_activation_tick.store(tick);
+
+                return true;
+            }
+
+            return false;
+        }
     }
 
-    bool release_note(int32_t note)
+    bool release_note(int8_t note)
     {
-        for (auto &articulation: articulations)
+        for (auto &articulation : articulations)
         {
-            if (articulation.note.load() != note + 1){
+            if (articulation.note.load() != note)
+            {
                 continue;
             }
 
-            articulation.note.store(0);
+            if (sustain_tick == 0)
+                articulation.activated.store(false);
 
             return true;
         }
@@ -229,10 +283,15 @@ public:
 
     void set_note_offset(int32_t note_offset)
     {
-        for (auto &oscillator: oscillators)
+        for (auto &oscillator : oscillators)
         {
             oscillator.note_offset.store(note_offset);
         }
+    }
+
+    void set_sustain_tick(float sustain_sec)
+    {
+        sustain_tick.store((int32_t)(sustain_sec * sample_rate));
     }
 
     Osc3x()

@@ -2,6 +2,10 @@
 
 This report analyses the real-time tasks, scheduling and data sharing mechanisms implemented in the StackSynth synthesizer project.
 
+Knob functionality can be changed with joystick moving left/right for switching functionalies.
+
+When joystick moving up and down, we can enter teach/play mode. Where it can play the sound out and you can see which note you need to play from the screen so that you can learn from that
+
 ## Task Identification and Implementation
 
 ### Audio Processing (Interrupt-based)
@@ -48,13 +52,41 @@ This report analyses the real-time tasks, scheduling and data sharing mechanisms
     - add key into keybuffer for pressing if any of the key is pressed via iteration
     - Creating CAN messages when keys change state (pressed/released)
     - Decoding rotary encoder knob movements using quadrature signals
-    - Updating system parameters (e.g., volume control for knob 3, octave for knob 2, wave for knob 1) based on knob rotation
+    - Updating system parameters (check what value joystick currently have) based on knob rotation
     - Scanning at a fast rate (20ms) to catch brief input changes
   - **Critical Aspects:** Must run frequently enough to catch key and knob transitions
 
+- **scanJoystickTask**
+
+    - **Type**: FreeRTOS Task (Thread)
+
+    - **Functionality**:
+
+        - Runs periodically (every 100 ms) using vTaskDelayUntil() to sample joystick positions.
+
+        - Reads the analog X and Y values from the joystick using analogRead() on defined pins.
+
+        - Compares the measured values against a preset origin (490) and a dead zone (150) to filter out noise and minor fluctuations.
+
+        - Determines the joystick’s directional movement:
+
+        - If both X and Y are within the dead zone, it interprets the state as “origin”.
+
+        - If X deviates positively (greater than origin + dead zone), it interprets it as a “left” movement.
+
+        - If X deviates negatively (less than origin − dead zone), it interprets it as a “right” movement.
+
+        - Similarly, it detects “up” or “down” based on the Y axis.
+
+        - Updates a global movement state or uses the movement information to adjust system parameters (e.g., navigating menu selections or modifying settings).
+
+        - Maintains a previous state variable to ensure that only significant changes in direction trigger an update.
+
+    - Critical Aspects: Must sample frequently enough to capture rapid joystick movements accurately, while the dead zone prevents false triggers from minor signal fluctuations.
+
 ### User Interface and Feedback (Thread-based)
 
-- **displayUpdateTask** TODO
+- **displayUpdateTask** 
   - **Type:** Thread
   - **Functionality:** Updates the visual feedback systems by:
     - Reading current system parameters (frequency, key states, etc.)
@@ -96,6 +128,7 @@ This report analyses the real-time tasks, scheduling and data sharing mechanisms
 | displayUpdateTask | 100 ms                              | 15ms                    | Display writes dominate execution time                       |
 | decodeTask        | Event-driven (~25 ms worst-case)    | 4 μs                    | Processing time depends on message type                      |
 | CAN_TX_Task       | Event-driven (~1.67 ms per message) | 869 μs                  | Fast operation, mostly waits on hardware                     |
+| scanJoystickTask  | 100ms                               | 300μs                   | read data from joystick                                      |
 
 ## Critical Instant Analysis
 
@@ -105,15 +138,16 @@ Using rate-monotonic scheduling theory and the measured execution times:
    - sampleISR: 16μs / 45μs = 0.356 utilization
    - scanKeysTask: 150μs / 20ms = 0.008 utilization
    - displayUpdateTask: 15ms / 100ms = 0.15 utilization
+   - scanJoystickTask: 300μs / 100ms =0.003 utilization
 2. **Event-driven Tasks:**
    - CAN_RX_ISR: Negligible overhead, only active when messages arrive
    - CAN_TX_ISR: Negligible overhead, only active after transmission
    - decodeTask: Bounded by message arrival rate
    - CAN_TX_Task: Bounded by message generation rate
 3. **Schedulability Test:**
-   - Sum of utilizations = 0.356 + 0.008 + 0.15 = 0.514
+   - Sum of utilizations = 0.356 + 0.008 + 0.15 + 0.003 = 0.517
 
-For three periodic tasks, the theoretical rate-monotonic bound is approximately 77.9% (for 3 tasks), so 51.4% < 77.9%.
+For three periodic tasks, the theoretical rate-monotonic bound is approximately 77.9% (for 3 tasks), so 51.7% < 77.9%.
 
 **Conclusion:** The tasks are schedulable under worst-case conditions.
 
@@ -128,7 +162,8 @@ For three periodic tasks, the theoretical rate-monotonic bound is approximately 
 | CAN_TX_ISR        | 0.02% (estimated)      | 2μs per message, ~100 messages/sec worst case        |
 | decodeTask        | 0.01% (estimated)      | 1ms × 10 Hz (average rate of processing)             |
 | CAN_TX_Task       | 0.87% (estimated)      | 0.5ms × 10 Hz (average rate of processing)           |
-| **Total**         | **~51.4%**             | Significant headroom remains for additional features |
+| scanJoystickTask  | 0.3%                   | 300μs × 10 Hz                                        |
+| **Total**         | **~51.7%**             | Significant headroom remains for additional features |
 
 ## Shared Data Structures and Synchronisation
 
@@ -145,6 +180,13 @@ For three periodic tasks, the theoretical rate-monotonic bound is approximately 
 | sysState.location   | std::atomic<uint8_t>(declared in main.cpp)                   | Atomic                                                       |
 | keyBuffer           | KeyPressBuffer (class)                                       | ensure synchornisation in method                             |
 | osc                 | Osc3x (class)                                                | ensure synchornisation in method                             |
+| octave              | std::atomic<uint8_t>                                         | Atomic                                                       |
+| mode                | std::atomic<EXE_Mode>                                        | Atomic                                                       |
+| song_index          | std::atomic<uint8_t>                                         | Atomic                                                       |
+| west_record         | std::atomic\<bool>                                           | Atomic                                                       |
+| east_record         | std::atomic\<bool>                                           | Atomic                                                       |
+| page_column_index   | std::atomic<uint8_t>[3]                                      | Atomic                                                       |
+| volume              | std::atomic<uint8_t>                                         | Atomic                                                       |
 
 ### Synchronisation Strategy:
 
@@ -201,6 +243,34 @@ This method sets the note offset for all oscillators, which adjusts their pitch 
 ### KeyPressBuffer Class
 
 The KeyPressBuffer class encapsulates the storage and formatting of key press and key release messages. These messages are used to notify other modules when keys are pressed or released.
+
+### song class
+
+The **Song** class encapsulates a musical composition as a sequence of note values and timing markers, and it provides methods for sequential playback. It is designed to be instantiated with a defined array of note data and a song name, and it manages playback progress internally.
+
+**Key Methods:**
+
+**std::vector<uint8_t> get_next():**
+
+Iterates from the current index through the note array until it reaches a BREAK token. During this iteration, it processes special tokens (e.g., WHOLE_STOP, HALF_STOP, QUATER_STOP) that modify the rhythmic count. If the current rhythmic count (tracked by _offset) falls within a specific range of the note duration, that note is included in the output vector. After processing, _offset is incremented and, if it exceeds its threshold (4), the index is advanced to the next segment.
+
+**void reset():**
+
+Resets playback by setting _index back to 0, allowing the song to start over.
+
+This class provides an efficient, thread-safe mechanism for sequentially reading and processing musical data, ensuring that notes are output in sync with the rhythm and allowing for dynamic playback control.
+
+### **drawPiano()**
+
+**Purpose:**
+
+Draws a simplified piano graphic on the OLED display using the U8g2 library.
+
+A static piano graphic that provides a visual reference for key positions on the display.
+
+### **drawNode**
+
+Renders a visual “node” on the display corresponding to a note or key event, where the node’s position and size are determined by musical or timing parameters.
 
 ### send_handshake_signal()
 

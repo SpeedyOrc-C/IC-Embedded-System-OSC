@@ -25,15 +25,66 @@ struct
 #define sysMutexAcquireRx() xSemaphoreTake(sysState.rx_meg_mutex, portMAX_DELAY);
 #define sysMutexReleaseRx() xSemaphoreGive(sysState.rx_meg_mutex);
 
-
 volatile uint8_t TX_Message[8] = {0}; // Outgoing CAN message
 volatile uint8_t RX_Message[8] = {0}; // Latest received CAN message
 
-QueueHandle_t msgInQ = xQueueCreate(36, 8);               // Queue for received messages
-QueueHandle_t msgOutQ = xQueueCreate(36, 8);              // Queue for messages to transmit
+QueueHandle_t msgInQ;
+QueueHandle_t msgOutQ;
 SemaphoreHandle_t CAN_TX_Semaphore; // Counting semaphore for CAN TX mailboxes
 Osc3x osc;
 KeyPressBuffer keyBuffer(&osc);
+
+
+
+// test functions
+// Define a function pointer type for test functions
+typedef void (*TestFuncThread)(void *);
+typedef void (*TestFuncIntterupt)();
+
+void fillmsgQ(){
+  uint8_t RX_Message[8] = {'P', 0, 0, 0, 0, 0, 0, 0}; 
+  for (int a = 0; a < 60; a++){
+    xQueueSend(msgOutQ, RX_Message, portMAX_DELAY);
+  }
+}
+
+void time_CAN_TX_Task () {
+	uint8_t msgOut[8];
+  for (int i=0;i<60;i++){
+      xQueueReceive(msgOutQ, msgOut, portMAX_DELAY);
+  }
+}
+
+// Wrapper to run a single test function 32 times and print elapsed time
+void runTestThread(TestFuncThread func, const char *testName)
+{
+  Serial.print("Running ");
+  Serial.println(testName);
+  uint32_t startTime = micros();
+  for (int i = 0; i < 32; i++)
+  {
+    func(NULL); // Each test function is expected to run one iteration of its test.
+  }
+  uint32_t elapsed = micros() - startTime;
+  Serial.print(testName);
+  Serial.print(" elapsed time: ");
+  Serial.println(elapsed/32.0 / 1000, 4); // convert to ms
+}
+
+void runTestIntterupt(TestFuncIntterupt func, const char *testName)
+{
+  Serial.print("Running ");
+  Serial.println(testName);
+  uint32_t startTime = micros();
+  for (int i = 0; i < 32; i++)
+  {
+    func(); // Each test function is expected to run one iteration of its test.
+  }
+  uint32_t elapsed = micros() - startTime;
+  Serial.print(testName);
+  Serial.print(" elapsed time: ");
+  Serial.println(elapsed/32.0 / 1000, 4);
+}
 
 // Forward declarations of new task functions
 void decodeTask(void *pvParameters)
@@ -41,7 +92,9 @@ void decodeTask(void *pvParameters)
   uint8_t msgIn[8];
   while (1)
   {
-    xQueueReceive(msgInQ, msgIn, portMAX_DELAY);
+    #ifndef TEST_DECODE
+      xQueueReceive(msgInQ, msgIn, portMAX_DELAY);
+    #endif
     // Copy the received message to RX_Message.
     sysMutexAcquireRx();
     for (int i = 0; i < 8; i++)
@@ -61,6 +114,9 @@ void decodeTask(void *pvParameters)
         // osc.release_note(msgIn[2]);
       }
     }
+    #ifdef TEST_DECODE
+      break;
+    #endif
   }
 }
 
@@ -69,10 +125,22 @@ void CAN_TX_Task(void *pvParameters)
   uint8_t msgOut[8];
   while (1)
   {
+#ifndef TEST_CAN_TASK
     xQueueReceive(msgOutQ, msgOut, portMAX_DELAY);
     // Wait for a mailbox slot to be free.
     xSemaphoreTake(CAN_TX_Semaphore, portMAX_DELAY);
+#else
+    // Test message
+    msgOut[0] = 'D';
+    msgOut[1] = 4;
+    msgOut[2] = 5;
+    msgOut[3] = 6;
+#endif
+
     CAN_TX(0x123, msgOut);
+#ifdef TEST_CAN_TASK
+    break;
+#endif
   }
 }
 
@@ -82,9 +150,9 @@ void CAN_RX_ISR(void)
   uint8_t RX_Message_ISR[8];
   uint32_t id;
   CAN_RX(id, RX_Message_ISR);
-  Serial.println("RX :");
-  Serial.println((char) RX_Message_ISR[0]);
-  xQueueSendFromISR(msgInQ, RX_Message_ISR, NULL);
+  #ifndef Disable_CAN_RegisterRX_ISR
+    xQueueSendFromISR(msgInQ, RX_Message_ISR, NULL);
+  #endif
 }
 
 // CAN transmit ISR – gives the semaphore each time a mailbox slot is freed.
@@ -92,9 +160,6 @@ void CAN_TX_ISR(void)
 {
   xSemaphoreGiveFromISR(CAN_TX_Semaphore, NULL);
 }
-
-// Constants
-const uint32_t interval = 100; // Display update interval
 
 // Pin definitions
 // Row select and enable
@@ -136,38 +201,6 @@ const int KNOB_2_MIN = 0;
 const int KNOB_2_MAX = 4;
 const int KNOB_3_MIN = 0;
 const int KNOB_3_MAX = 8;
-
-// step size definition
-// Update the phase step sizes for 12 notes.
-// S = (2^32 * f) / 22000, where f = 440 * 2^((i - 9)/12)
-// These values are approximate.
-const uint32_t stepSizes[] = {
-    51043965, // Note 0: ~261.6 Hz
-    54176000, // Note 1: ~277.4 Hz
-    57309000, // Note 2: ~293.3 Hz
-    60752000, // Note 3: ~311.1 Hz
-    64300000, // Note 4: ~329.6 Hz
-    68154000, // Note 5: ~349.3 Hz
-    72130000, // Note 6: ~369.6 Hz
-    76490000, // Note 7: ~391.9 Hz
-    81000000, // Note 8: ~415.3 Hz
-    85900000, // Note 9: 440.0 Hz (A)
-    91000000, // Note 10: ~466.2 Hz
-    96400000  // Note 11: ~493.9 Hz
-};
-const float amplitudes[] = {
-    0.0f,
-    0.125f,
-    0.25f,
-    0.375f,
-    0.5f,
-    0.625f,
-    0.75f,
-    0.875f,
-    1.0f};
-
-// Global variable to hold the current phase step size.
-volatile uint32_t currentStepSize = 0;
 
 // C++
 // Global timer object using TIM1 from stm32duino HardwareTimer library.
@@ -298,7 +331,9 @@ void scanKeysTask(void *pvParameters)
 
   while (1)
   {
+    #ifndef TEST_SCANKEYS
     vTaskDelayUntil(&xLastWakeTime, xFrequency);
+    #endif
 
     std::bitset<32> inputsTemp = readInput();
 
@@ -343,8 +378,8 @@ void scanKeysTask(void *pvParameters)
           TX_Message[0] = 'P';
         else
           TX_Message[0] = 'R';
-          TX_Message[1] = 4;    // For example, fixed octave 4
-          TX_Message[2] = note; // Note number
+        TX_Message[1] = 4;                        // For example, fixed octave 4
+        TX_Message[2] = note;                     // Note number
         TX_Message[3] = sysState.location.load(); // location
         // Send TX_Message via the transmit queue:
         xQueueSend(msgOutQ, (void *)TX_Message, portMAX_DELAY);
@@ -368,6 +403,9 @@ void scanKeysTask(void *pvParameters)
       int i = (knobRotation[3].read_current());
       osc.oscillators[0].amplitude.store(0.125f * (float)i);
     }
+#ifdef TEST_SCANKEYS
+    break;
+#endif
   }
 }
 
@@ -379,14 +417,14 @@ void displayUpdateTask(void *pvParameters)
 
   while (1)
   {
-    vTaskDelayUntil(&xLastWakeTime, xFrequency);
+    #ifndef TEST_DISPLAY
+      vTaskDelayUntil(&xLastWakeTime, xFrequency);
+    #endif
 
     u8g2.clearBuffer();
     u8g2.setFont(u8g2_font_ncenB08_tr);
     // Display current phase step size (read atomically)
     char buf[12];
-    uint32_t displayStepSize = __atomic_load_n(&currentStepSize, __ATOMIC_RELAXED);
-    sprintf(buf, "%lu", displayStepSize);
     u8g2.drawStr(2, 10, buf);
     // Also display lower 12 bits of the key matrix input.
     u8g2.setCursor(2, 20);
@@ -429,6 +467,9 @@ void displayUpdateTask(void *pvParameters)
     u8g2.sendBuffer();
 
     digitalToggle(LED_BUILTIN); // Blink LED to indicate timing
+#ifdef TEST_DISPLAY
+    break;
+#endif
   }
 }
 
@@ -512,7 +553,7 @@ uint8_t autoDetection(){
     // u8g2.print(EastDetect[0]);
     // u8g2.sendBuffer();
     // sysState.location.store(1);
-    
+
     do{
       inputs = readInput();
       WestDetect[0] = inputs[23];
@@ -566,7 +607,7 @@ uint8_t autoDetection(){
     return id + 1;
   }
 
-  
+
 }
 
 void loop()
@@ -608,36 +649,47 @@ void setup()
   // --- CAN bus initialisation ---
   CAN_Init(true);            // Loopback mode for testing
   setCANFilter(0x123, 0x7FF); // Only accept messages with ID 0x123
-  
+
   // Create counting semaphore for 3 mailbox slots.
   CAN_TX_Semaphore = xSemaphoreCreateCounting(3, 3);
   // Register CAN TX and RX ISRs.
-  CAN_RegisterTX_ISR(CAN_TX_ISR);
-  CAN_RegisterRX_ISR(CAN_RX_ISR);
-
+  #ifndef Disable_CAN_RegisterRX_ISR
+    CAN_RegisterRX_ISR(CAN_RX_ISR);
+  #endif
+  #ifndef Disable_CAN_RegisterTX_ISR
+    CAN_RegisterTX_ISR(CAN_TX_ISR);
+  #endif
   CAN_Start();
-
-  // u8g2.clearBuffer();
-  // u8g2.setFont(u8g2_font_ncenB08_tr);
-  // u8g2.setCursor(20, 20);
-  // u8g2.print("detecting boards");
-  // u8g2.sendBuffer();
+  // Initialise Queues
+  #ifndef Disable_msgque
+    msgInQ = xQueueCreate(36, 8);
+    msgOutQ = xQueueCreate(36, 8);
+  #else
+    msgInQ = xQueueCreate(384, 8);
+    msgOutQ = xQueueCreate(384, 8);
+  #endif
+  
 
   sysState.location.store(autoDetection());
-  send_handshake_signal(1,1);
-  if(sysState.location == 0){
+  send_handshake_signal(1, 1);
+  if (sysState.location == 0)
+  {
     sysState.isReceiver.store(true);
   }
-  
+
   Serial.println("LOCATION:");
   Serial.println(sysState.location);
   // Configure timer to trigger the sampleISR() at 22kHz.
   sampleTimer.setOverflow(22000, HERTZ_FORMAT);
-  sampleTimer.attachInterrupt(sampleISR);
+  #ifndef Disable_attachInterrupt_sampleISR
+    sampleTimer.attachInterrupt(sampleISR);
+  #endif
   sampleTimer.resume();
 
 
   // Create FreeRTOS tasks.
+#ifdef DISABLE_THREADSs
+
   TaskHandle_t scanKeysHandle = NULL;
   xTaskCreate(
       scanKeysTask,     /* Function that implements the task */
@@ -651,18 +703,72 @@ void setup()
   TaskHandle_t displayHandle = NULL;
   xTaskCreate(displayUpdateTask, "display", 256, NULL, 1, &displayHandle);
 
-
   TaskHandle_t decodeHandle = NULL;
   xTaskCreate(decodeTask, "decode", 128, NULL, 1, &decodeHandle);
 
   TaskHandle_t canTxHandle = NULL;
   xTaskCreate(CAN_TX_Task, "CAN_TX", 128, NULL, 1, &canTxHandle);
+#endif
 
   // Create a mutex to protect the shared sysState.inputs.
   sysState.mutex = xSemaphoreCreateMutex();
 
   // Create a mutex to protect the shared sysState.rx_meg_mutex.
   sysState.rx_meg_mutex = xSemaphoreCreateMutex();
+
+// osc.oscillators[1].amplitude.store(0.2f);
+// osc.oscillators[1].shape.store(TriangularWave);
+// osc.oscillators[2].amplitude.store(0.2f);
+// osc.oscillators[2].shape.store(SawtoothWave);
+
+// testing thread
+#ifdef TEST_SCANKEYS
+  runTestThread(scanKeysTask, "scanKeysTask");
+#endif
+#ifdef TEST_DISPLAY
+  runTestThread(displayUpdateTask, "displayUpdateTask");
+#endif
+#ifdef TEST_DECODE
+  runTestThread(decodeTask, "decodeTask");
+#endif
+#ifdef TEST_SAMPLEISR
+  runTestIntterupt(sampleISR, "sampleISR");
+#endif
+#ifdef TEST_CAN_TASK
+  runTestThread(CAN_TX_Task, "CAN_Task");
+#endif
+#ifdef TEST_CAN_TX
+  runTestIntterupt1(CAN_TX_ISR, "CAN_TX_ISR");
+#endif
+#ifdef TEST_CAN_RX
+  Serial.print("Running ");
+  uint32_t elapsed_tx = 0;
+  uint32_t elapsed_rx = 0;
+  uint32_t startTime = 0;
+  // for (int i = 0; i < 32; i++)
+  // {
+    Serial.print("Running1 ");
+    CAN_TX_Task(NULL);
+    xSemaphoreTake(CAN_TX_Semaphore, portMAX_DELAY);
+    startTime = micros();
+    Serial.print("Running2 ");
+    CAN_RX_ISR();
+    elapsed_tx += micros() - startTime;
+    startTime = micros();
+    Serial.print("Running3 ");
+    CAN_TX_ISR();
+    elapsed_rx += micros() - startTime;
+  // }
+  Serial.print("CAN_TX_ISR elapsed time: ");
+  Serial.println(elapsed_tx / 32.0 / 1000, 4); // convert to ms
+  Serial.print("CAN_RX_ISR elapsed time: ");
+  Serial.println(elapsed_rx / 32.0 / 1000, 4); // convert to ms
+
+  
+
+  
+
+#endif
 
   // Start FreeRTOS scheduler.
   vTaskStartScheduler();

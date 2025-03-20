@@ -34,10 +34,11 @@ struct
   std::atomic<uint8_t> octave = 0;
   std::atomic<EXE_Mode> mode = NORMAL;
   std::atomic<uint8_t> song_index = 0;
-  std::atomic<bool> west_record;
-  std::atomic<bool> east_record;
+  std::bitset<1> west_record;
+  std::bitset<1> east_record;
   std::atomic<uint8_t> page_column_index[3]{0, 0, 0};
   std::atomic<uint8_t> volume = 1;
+  std::atomic<bool> ready = false;
 } sysState;
 #define sysMutexAcquire() xSemaphoreTake(sysState.mutex, portMAX_DELAY);
 #define sysMutexRelease() xSemaphoreGive(sysState.mutex);
@@ -151,33 +152,50 @@ void decodeTask(void *pvParameters)
     {
       if (msgIn[0] == 'P')
       {
-        // osc.set_note_offset(msgIn[3] * 12); // TODO
         keyBuffer.apply_key(msgIn[2] + msgIn[3] * 12, true);
-        // osc.press_note(msgIn[2]);
       }
       else if (msgIn[0] == 'R')
       {
         keyBuffer.apply_key(msgIn[2] + msgIn[3] * 12, false);
         // osc.release_note(msgIn[2]);
       }
-      else if (msgIn[0] == 'O')
+    }
+    if (msgIn[0] == 'O')
+    {
+      // when changing the octave
+      sysState.octave.store(sysState.location + msgIn[1]);
+    }
+    else if (msgIn[0] == 'A')
+    {
+      // when there is someone checked that its neighbour left
+      // sent from ends of the boards
+
+      // uint8_t offset = sysState.octave.load() - sysState.location.load();
+      delay(10);
+      sysState.location.store(autoDetection());
+      sysState.isReceiver.store(sysState.location == 0);
+      sysState.octave.store(sysState.location + 1);
+      if (sysState.location == 0)
       {
-        // when changing the octave
-        sysState.octave.store(sysState.location + msgIn[1]);
+        sysState.isReceiver.store(true);
       }
-      else if (msgIn[0] == 'A')
+    }
+    else if (msgIn[0] == 'S')
+    {
+      sysState.song_index.store(msgIn[1]);
+      songs[sysState.song_index].reset();
+      sysState.mode.store(TEACHING);
+    }
+    else if (msgIn[0] == 'K')
+    {
+      if (sysState.mode.load() == PLAYING || sysState.mode.load() == TEACHING)
       {
-        // when there is someone checked that its neighbour left
-        // sent from ends of the boards
-        delay(10);
-        sysState.location.store(autoDetection());
-        sysState.isReceiver.store(sysState.location == 0);
-      }
-      else if (msgIn[0] == 'S')
-      {
-        sysState.song_index.store(msgIn[1]);
-        songs[sysState.song_index].reset();
-        sysState.mode.store(PLAYING);
+        // to clean the song buffer
+        for (int i = 0; i < 8; i++)
+        {
+          songNotes[i] = std::vector<uint8_t>();
+        }
+        sysState.mode.store(NORMAL);
       }
     }
   }
@@ -250,9 +268,9 @@ const int KNOB_B[4]{19, 17, 15, 13};
 const int KNOB_0_MIN = 0;
 const int KNOB_0_MAX = 8;
 const int KNOB_1_MIN = 0;
-const int KNOB_1_MAX = 8;
+const int KNOB_1_MAX = 3;
 const int KNOB_2_MIN = 0;
-const int KNOB_2_MAX = 8;
+const int KNOB_2_MAX = 4;
 const int KNOB_3_MIN = 0;
 const int KNOB_3_MAX = 8;
 
@@ -512,6 +530,50 @@ void scanJoystickTask(void *pvParameters)
   }
 }
 
+void detectBreak(void *pvParameters)
+{
+  const TickType_t xFrequency = 250 / portTICK_PERIOD_MS;
+  TickType_t xLastWakeTime = xTaskGetTickCount();
+  uint32_t localStepSize = 0;
+
+  while (1)
+  {
+    vTaskDelayUntil(&xLastWakeTime, xFrequency);
+    if(sysState.ready.load()){
+
+      std::bitset<32> inputsTemp;
+      sysMutexAcquire();
+      inputsTemp = sysState.inputs;
+      sysMutexRelease();
+  
+      std::bitset<1> WestDetect;
+      std::bitset<1> EastDetect;
+      WestDetect[0] = inputsTemp[23];
+      EastDetect[0] = inputsTemp[27];
+      if(sysState.east_record[0] != EastDetect[0] ||sysState.west_record[0] != WestDetect[0]){
+        delay(20);
+        TX_Message[0] = 'A';
+
+        TX_Message[1] = WestDetect[0];
+        TX_Message[2] = EastDetect[0];
+        TX_Message[3] = sysState.east_record[0];
+        TX_Message[4] = sysState.west_record[0];
+        // Send TX_Message via the transmit queue:
+        xQueueSend(msgOutQ, (void *)TX_Message, portMAX_DELAY);
+        delay(10);
+        sysState.location.store(autoDetection());
+        sysState.isReceiver.store(sysState.location == 0);
+        sysState.octave.store(sysState.location + 1);
+        if (sysState.location == 0)
+        {
+          sysState.isReceiver.store(true);
+        }
+      }
+    }
+    
+
+  }
+}
 
 // Task to scan keys and update global currentStepSize.
 void scanKeysTask(void *pvParameters)
@@ -594,10 +656,19 @@ void scanKeysTask(void *pvParameters)
           {
             songNotes[i] = std::vector<uint8_t>();
           }
+          TX_Message[0] = 'K';
+
+          // Send TX_Message via the transmit queue:
+          xQueueSend(msgOutQ, (void *)TX_Message, portMAX_DELAY);
           sysState.mode.store(NORMAL);
         }
         else if (sysState.mode.load() == SELECT_PLAYING_STATE)
         {
+          TX_Message[0] = 'S';
+          TX_Message[1] = sysState.song_index.load(); // For example, fixed octave 4
+
+          // Send TX_Message via the transmit queue:
+          xQueueSend(msgOutQ, (void *)TX_Message, portMAX_DELAY);
           songs[sysState.song_index.load()].reset();
           sysState.mode.store(PLAYING);
         }
@@ -623,7 +694,14 @@ void scanKeysTask(void *pvParameters)
       if (knobRotation[page_column][1].update_rotate())
       {
         int i = (knobRotation[page_column][1].read_current());
-        osc.oscillators[0].amplitude.store(0.125f * (float)i);
+        sysState.octave = i;
+        osc.set_note_offset((i - 1) * 12);
+
+        TX_Message[0] = 'O';
+        TX_Message[1] = i; // For example, fixed octave 4
+
+        // Send TX_Message via the transmit queue:
+        xQueueSend(msgOutQ, (void *)TX_Message, portMAX_DELAY);
       }
     }
     else
@@ -639,6 +717,10 @@ void scanKeysTask(void *pvParameters)
         osc.oscillators[page_column - 1].amplitude.store(0.125f * (float)i);
       }
     }
+
+    // if(inputsTemp[] == ){
+
+    // }
   }
 }
 
@@ -829,13 +911,16 @@ void displayUpdateTask(void *pvParameters)
         }
       }
 
+      uint8_t octave = sysState.octave.load();
       for (int j = 0; j < 8; j++)
       {
 
         for (uint8_t note : songNotes[k])
         {
+          if(note >= octave*12 && note < (octave + 1) * 12){
+            drawNode(note - octave*12, j, (4 - i % 4) % 4);
 
-          drawNode(note, j, (4 - i % 4) % 4);
+          }
         }
         // drawNode(j, j, (4 - i % 4) % 4);
         k++;
@@ -854,6 +939,7 @@ void displayUpdateTask(void *pvParameters)
 
 uint8_t autoDetection()
 {
+  sysState.ready.store(false);
   uint8_t msgOut[8] = {0}; // message out
   uint8_t msgIn[8] = {0};  // message in
 
@@ -871,8 +957,8 @@ uint8_t autoDetection()
   WestDetect[0] = inputs[23];
   EastDetect[0] = inputs[27];
 
-  sysState.east_record.store(EastDetect[0]);
-  sysState.west_record.store(WestDetect[0]);
+  sysState.east_record[0] = (EastDetect[0]);
+  sysState.west_record[0] = (WestDetect[0]);
 
   u8g2.clearBuffer();
   u8g2.setFont(u8g2_font_ncenB08_tr);
@@ -905,6 +991,13 @@ uint8_t autoDetection()
     }
     else
     {
+      
+      for(int i = 0; i < 10; i++){
+        send_handshake_signal(1, 1);
+        delay(30);
+
+      }
+      sysState.ready.store(true);
       return 0;
     }
     while (true)
@@ -919,6 +1012,13 @@ uint8_t autoDetection()
       };
       delayMicroseconds(30000);
     }
+    
+    for(int i = 0; i < 10; i++){
+      send_handshake_signal(1, 1);
+      delay(30);
+
+    }
+    sysState.ready.store(true);
     return 0;
   }
   else
@@ -963,7 +1063,13 @@ uint8_t autoDetection()
         send_handshake_signal(0, 0);
         delay(30);
       }
-      Serial.println("finished");
+      
+      for(int i = 0; i < 10; i++){
+        send_handshake_signal(1, 1);
+        delay(30);
+
+      }
+      sysState.ready.store(true);
       return id + 1;
     }
     for (int i = 0; i < 10; i++)
@@ -982,6 +1088,9 @@ uint8_t autoDetection()
         break;
       };
     }
+    send_handshake_signal(1, 1);
+    delay(30);
+    sysState.ready.store(true);
     return id + 1;
   }
 }
@@ -1037,7 +1146,7 @@ void setup()
   CAN_Start();
 
   sysState.location.store(autoDetection());
-  send_handshake_signal(1, 1);
+  sysState.octave.store(sysState.location + 1);
   if (sysState.location == 0)
   {
     sysState.isReceiver.store(true);
@@ -1072,6 +1181,10 @@ void setup()
 
   TaskHandle_t joyHandle = NULL;
   xTaskCreate(scanJoystickTask, "scan_joy_input", 128, NULL, 1, &joyHandle);
+
+  
+  TaskHandle_t detecBreakHandle = NULL;
+  xTaskCreate(detectBreak, "detectBreak", 64, NULL, 1, &detecBreakHandle);
 
   // Create a mutex to protect the shared sysState.inputs.
   sysState.mutex = xSemaphoreCreateMutex();

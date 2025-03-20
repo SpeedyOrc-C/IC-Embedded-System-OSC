@@ -102,7 +102,7 @@ struct Oscillator
 public:
     std::atomic<WaveShape> shape = TriangularWave;
     std::atomic<float> amplitude = 0.0f;
-    std::atomic<int32_t> note_offset = 0;
+    std::atomic<int32_t> note_offset = -12;
     std::atomic<float> phase_offset = 0.0f;
 };
 
@@ -167,7 +167,7 @@ public:
                 case SawtoothWave:height = 2.0f * (phase_decimal_part - 0.5f);
                     break;
 
-                case NoiseWave:height = (float) random() * 2 / (float) UINT32_MAX - 1.0f;
+                case NoiseWave:height = (float) (random() * 2) / (float) UINT32_MAX - 1.0f;
                     break;
 
                 default:height = 0.0f;

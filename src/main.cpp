@@ -8,31 +8,129 @@
 #include <Osc3x.h>
 #include <KeyPressBuffer.h>
 #include <atomic>
-extern "C"{
-#include <game.h>
-}
+#include <song.h>
+
+extern uint8_t autoDetection();
+
+std::vector<uint8_t> songNotes[8];
+std::atomic<uint8_t> songIndex;
+
+enum EXE_Mode
+{
+  SELECT_PLAYING_STATE,
+  NORMAL,
+  SELECT_TEACHING_STATE,
+  TEACHING,
+  PLAYING
+};
 
 struct
 {
   std::bitset<32> inputs;
   SemaphoreHandle_t mutex;
   SemaphoreHandle_t rx_meg_mutex;
-  std::atomic<bool> isReceiver = false; // we define the receiver as the rightmost board
-  std::atomic<uint8_t> location = 0;    // 0 leftmost, 1 middle, 2 rightmost
+  std::atomic<bool> isReceiver = false; // we define the receiver as the leftmost board
+  std::atomic<uint8_t> location = 0;    //
+  std::atomic<uint8_t> octave = 0;
+  std::atomic<EXE_Mode> mode = NORMAL;
+  std::atomic<uint8_t> song_index = 0;
+  std::atomic<bool> west_record;
+  std::atomic<bool> east_record;
+  std::atomic<uint8_t> page_column_index[3]{0, 0, 0};
+  std::atomic<uint8_t> volume = 1;
 } sysState;
 #define sysMutexAcquire() xSemaphoreTake(sysState.mutex, portMAX_DELAY);
 #define sysMutexRelease() xSemaphoreGive(sysState.mutex);
 #define sysMutexAcquireRx() xSemaphoreTake(sysState.rx_meg_mutex, portMAX_DELAY);
 #define sysMutexReleaseRx() xSemaphoreGive(sysState.rx_meg_mutex);
 
+// assume that 1 lower lower will be 1
+const uint8_t butterfly[] = {
+    HALF_STOP, HALF_NOTE(NOTE_TRANSHFER(N5, 1)), BREAK,
+    HALF_NOTE(NOTE_TRANSHFER(N3, 1)), HALF_NOTE(NOTE_TRANSHFER(N2, 1)), BREAK,
+    WHOLE_NOTE(NOTE_TRANSHFER(N1, 1)), HALF_STOP, HALF_NOTE(NOTE_TRANSHFER(N5, 0)), BREAK,
+    WHOLE_NOTE(NOTE_TRANSHFER(N1, 1)), HALF_NOTE(NOTE_TRANSHFER(N3, 0)), HALF_NOTE(NOTE_TRANSHFER(N2, 0)), BREAK,
+    WHOLE_NOTE(NOTE_TRANSHFER(N1, 0)), HALF_STOP, HALF_NOTE(NOTE_TRANSHFER(N2, 1)), BREAK,
+    WHOLE_NOTE(NOTE_TRANSHFER(N1, 0)), HALF_NOTE(NOTE_TRANSHFER(N7, 0)), HALF_NOTE(NOTE_TRANSHFER(N6, 0)), BREAK,
+    WHOLE_NOTE(NOTE_TRANSHFER(N5, 0)), HALF_STOP, HALF_NOTE(NOTE_TRANSHFER(N2, 0)), BREAK,
+    WHOLE_NOTE(NOTE_TRANSHFER(N5, 0)), HALF_NOTE(NOTE_TRANSHFER(N7, -1)), HALF_NOTE(NOTE_TRANSHFER(N6, -1)), BREAK,
+    WHOLE_NOTE(NOTE_TRANSHFER(N5, -1)), HALF_STOP, HALF_NOTE(NOTE_TRANSHFER(N7, 1)), BREAK,
+    WHOLE_NOTE(NOTE_TRANSHFER(N5, -1)), HALF_NOTE(NOTE_TRANSHFER(N6, 1)), HALF_NOTE(NOTE_TRANSHFER(N7, 1)), BREAK,
+    WHOLE_NOTE(NOTE_TRANSHFER(N1, -1)), NOTE_TRANSHFER(N5, 1), 3, QUATER_NOTE(NOTE_TRANSHFER(N6, 1)), BREAK,
+    WHOLE_NOTE(NOTE_TRANSHFER(N5, -1)), HALF_NOTE(NOTE_TRANSHFER(N4_, 1)), HALF_NOTE(NOTE_TRANSHFER(N3, 1)), BREAK,
+    WHOLE_NOTE(NOTE_TRANSHFER(N5, -1)), QUATER_NOTE(NOTE_TRANSHFER(N2, 1)), QUATER_NOTE(NOTE_TRANSHFER(N3, 1)), QUATER_NOTE(NOTE_TRANSHFER(N4_, 1)), QUATER_NOTE(NOTE_TRANSHFER(N3, 1)), BREAK,
+    WHOLE_NOTE(NOTE_TRANSHFER(N5, -1)), NOTE_TRANSHFER(N5, 1), 3, QUATER_NOTE(NOTE_TRANSHFER(N3, 1)), BREAK,
+    WHOLE_NOTE(NOTE_TRANSHFER(N5, -1)), WHOLE_NOTE(NOTE_TRANSHFER(N2, -1)), QUATER_NOTE(NOTE_TRANSHFER(N2, 1)), QUATER_NOTE(NOTE_TRANSHFER(N3, 1)), QUATER_NOTE(NOTE_TRANSHFER(N5, 1)), QUATER_NOTE(NOTE_TRANSHFER(N2, 1)), BREAK,
+    QUATER_NOTE(NOTE_TRANSHFER(N3, 1)), QUATER_NOTE(NOTE_TRANSHFER(N4, 1)), QUATER_NOTE(NOTE_TRANSHFER(N3, 1)), QUATER_NOTE(NOTE_TRANSHFER(N2, 1)), BREAK,
+    WHOLE_NOTE(NOTE_TRANSHFER(N3, -1)), WHOLE_NOTE(NOTE_TRANSHFER(N1, -1)), WHOLE_NOTE(NOTE_TRANSHFER(N1, 1)), BREAK,
+    HALF_NOTE(NOTE_TRANSHFER(N1, 1)), HALF_NOTE(NOTE_TRANSHFER(N5, 1)), BREAK,
+    HALF_NOTE(NOTE_TRANSHFER(N7, 0)), HALF_NOTE(NOTE_TRANSHFER(N2, 1)), WHOLE_NOTE(NOTE_TRANSHFER(N5, -1)), WHOLE_NOTE(NOTE_TRANSHFER(N2, -1)), BREAK,
+    HALF_NOTE(NOTE_TRANSHFER(N6, 0)), HALF_NOTE(NOTE_TRANSHFER(N1, 1)), BREAK,
+    WHOLE_NOTE(NOTE_TRANSHFER(N1, -1)), WHOLE_NOTE(NOTE_TRANSHFER(N5, 0)), WHOLE_NOTE(NOTE_TRANSHFER(N3, -1)), BREAK,
+    HALF_NOTE(NOTE_TRANSHFER(N5, 0)), QUATER_NOTE(NOTE_TRANSHFER(N6, 0)), QUATER_NOTE(NOTE_TRANSHFER(N1, 1)), BREAK,
+    WHOLE_NOTE(NOTE_TRANSHFER(N5, 0)), HALF_NOTE(NOTE_TRANSHFER(N5, -2)), HALF_NOTE(NOTE_TRANSHFER(N2, -1)), BREAK,
+    WHOLE_NOTE(NOTE_TRANSHFER(N5, 0)), HALF_NOTE(NOTE_TRANSHFER(N5, -1)), HALF_NOTE(NOTE_TRANSHFER(N2, -1)), BREAK,
+    WHOLE_NOTE(NOTE_TRANSHFER(N5, 0)), HALF_NOTE(NOTE_TRANSHFER(N5, -1)), HALF_NOTE(NOTE_TRANSHFER(N2, -1)), BREAK,
+    WHOLE_NOTE(NOTE_TRANSHFER(N5, 0)), HALF_NOTE(NOTE_TRANSHFER(N5, -1)), HALF_NOTE(NOTE_TRANSHFER(N2, -1)), BREAK};
+
+// assume that 1 lower lower will be 1
+const uint8_t canon[] = {
+    HALF_STOP, HALF_NOTE(NOTE_TRANSHFER(N5, 1)), BREAK,
+    HALF_NOTE(NOTE_TRANSHFER(N3, 1)), HALF_NOTE(NOTE_TRANSHFER(N2, 1)), BREAK,
+    WHOLE_NOTE(NOTE_TRANSHFER(N1, 1)), HALF_STOP, HALF_NOTE(NOTE_TRANSHFER(N5, 0)), BREAK,
+    WHOLE_NOTE(NOTE_TRANSHFER(N1, 1)), HALF_NOTE(NOTE_TRANSHFER(N3, 0)), HALF_NOTE(NOTE_TRANSHFER(N2, 0)), BREAK,
+    WHOLE_NOTE(NOTE_TRANSHFER(N1, 0)), HALF_STOP, HALF_NOTE(NOTE_TRANSHFER(N2, 1)), BREAK,
+    WHOLE_NOTE(NOTE_TRANSHFER(N1, 0)), HALF_NOTE(NOTE_TRANSHFER(N7, 0)), HALF_NOTE(NOTE_TRANSHFER(N6, 0)), BREAK,
+    WHOLE_NOTE(NOTE_TRANSHFER(N5, 0)), HALF_STOP, HALF_NOTE(NOTE_TRANSHFER(N2, 0)), BREAK,
+    WHOLE_NOTE(NOTE_TRANSHFER(N5, 0)), HALF_NOTE(NOTE_TRANSHFER(N7, -1)), HALF_NOTE(NOTE_TRANSHFER(N6, -1)), BREAK,
+    WHOLE_NOTE(NOTE_TRANSHFER(N5, -1)), HALF_STOP, HALF_NOTE(NOTE_TRANSHFER(N7, 1)), BREAK,
+    WHOLE_NOTE(NOTE_TRANSHFER(N5, -1)), HALF_NOTE(NOTE_TRANSHFER(N6, 1)), HALF_NOTE(NOTE_TRANSHFER(N7, 1)), BREAK,
+    WHOLE_NOTE(NOTE_TRANSHFER(N1, -1)), NOTE_TRANSHFER(N5, 1), 3, QUATER_NOTE(NOTE_TRANSHFER(N6, 1)), BREAK,
+    WHOLE_NOTE(NOTE_TRANSHFER(N5, -1)), HALF_NOTE(NOTE_TRANSHFER(N4_, 1)), HALF_NOTE(NOTE_TRANSHFER(N3, 1)), BREAK,
+    WHOLE_NOTE(NOTE_TRANSHFER(N5, -1)), QUATER_NOTE(NOTE_TRANSHFER(N2, 1)), QUATER_NOTE(NOTE_TRANSHFER(N3, 1)), QUATER_NOTE(NOTE_TRANSHFER(N4_, 1)), QUATER_NOTE(NOTE_TRANSHFER(N3, 1)), BREAK,
+    WHOLE_NOTE(NOTE_TRANSHFER(N5, -1)), NOTE_TRANSHFER(N5, 1), 3, QUATER_NOTE(NOTE_TRANSHFER(N3, 1)), BREAK,
+    WHOLE_NOTE(NOTE_TRANSHFER(N5, -1)), WHOLE_NOTE(NOTE_TRANSHFER(N2, -1)), QUATER_NOTE(NOTE_TRANSHFER(N2, 1)), QUATER_NOTE(NOTE_TRANSHFER(N3, 1)), QUATER_NOTE(NOTE_TRANSHFER(N5, 1)), QUATER_NOTE(NOTE_TRANSHFER(N2, 1)), BREAK,
+    QUATER_NOTE(NOTE_TRANSHFER(N3, 1)), QUATER_NOTE(NOTE_TRANSHFER(N4, 1)), QUATER_NOTE(NOTE_TRANSHFER(N3, 1)), QUATER_NOTE(NOTE_TRANSHFER(N2, 1)), BREAK,
+    WHOLE_NOTE(NOTE_TRANSHFER(N3, -1)), WHOLE_NOTE(NOTE_TRANSHFER(N1, -1)), WHOLE_NOTE(NOTE_TRANSHFER(N1, 1)), BREAK,
+    HALF_NOTE(NOTE_TRANSHFER(N1, 1)), HALF_NOTE(NOTE_TRANSHFER(N5, 1)), BREAK,
+    HALF_NOTE(NOTE_TRANSHFER(N7, 0)), HALF_NOTE(NOTE_TRANSHFER(N2, 1)), WHOLE_NOTE(NOTE_TRANSHFER(N5, -1)), WHOLE_NOTE(NOTE_TRANSHFER(N2, -1)), BREAK,
+    HALF_NOTE(NOTE_TRANSHFER(N6, 0)), HALF_NOTE(NOTE_TRANSHFER(N1, 1)), BREAK,
+    WHOLE_NOTE(NOTE_TRANSHFER(N1, -1)), WHOLE_NOTE(NOTE_TRANSHFER(N5, 0)), WHOLE_NOTE(NOTE_TRANSHFER(N3, -1)), BREAK,
+    HALF_NOTE(NOTE_TRANSHFER(N5, 0)), QUATER_NOTE(NOTE_TRANSHFER(N6, 0)), QUATER_NOTE(NOTE_TRANSHFER(N1, 1)), BREAK,
+    WHOLE_NOTE(NOTE_TRANSHFER(N5, 0)), HALF_NOTE(NOTE_TRANSHFER(N5, -2)), HALF_NOTE(NOTE_TRANSHFER(N2, -1)), BREAK,
+    WHOLE_NOTE(NOTE_TRANSHFER(N5, 0)), HALF_NOTE(NOTE_TRANSHFER(N5, -1)), HALF_NOTE(NOTE_TRANSHFER(N2, -1)), BREAK,
+    WHOLE_NOTE(NOTE_TRANSHFER(N5, 0)), HALF_NOTE(NOTE_TRANSHFER(N5, -1)), HALF_NOTE(NOTE_TRANSHFER(N2, -1)), BREAK,
+    WHOLE_NOTE(NOTE_TRANSHFER(N5, 0)), HALF_NOTE(NOTE_TRANSHFER(N5, -1)), HALF_NOTE(NOTE_TRANSHFER(N2, -1)), BREAK};
 
 volatile uint8_t TX_Message[8] = {0}; // Outgoing CAN message
 volatile uint8_t RX_Message[8] = {0}; // Latest received CAN message
 
-QueueHandle_t msgInQ = xQueueCreate(36, 8);               // Queue for received messages
-QueueHandle_t msgOutQ = xQueueCreate(36, 8);              // Queue for messages to transmit
-SemaphoreHandle_t CAN_TX_Semaphore; // Counting semaphore for CAN TX mailboxes
+QueueHandle_t msgInQ = xQueueCreate(36, 8);  // Queue for received messages
+QueueHandle_t msgOutQ = xQueueCreate(36, 8); // Queue for messages to transmit
+SemaphoreHandle_t CAN_TX_Semaphore;          // Counting semaphore for CAN TX mailboxes
 Osc3x osc;
+
+#define SONG_NUM 2
+Song songs[SONG_NUM]{
+    Song(butterfly, sizeof(butterfly), "The Butterfly Lover"),
+    Song(canon, sizeof(canon), "Canon")};
+
+#define MAIN_KNOB_NUM 4
+const uint8_t MAX_COLUMN_NUM[3]{SONG_NUM, MAIN_KNOB_NUM, SONG_NUM};
+std::string knob_descript[MAIN_KNOB_NUM][4]{
+    {
+        "V:" // for volume
+        ,
+        "O:" // for octave
+    },
+    {"W1:",
+     "A1:"},
+    {"W2:",
+     "A2:"},
+    {"W3:",
+     "A3:"}};
+
+// Song i = Song(,"");
 KeyPressBuffer keyBuffer(&osc);
 
 // Forward declarations of new task functions
@@ -53,7 +151,7 @@ void decodeTask(void *pvParameters)
     {
       if (msgIn[0] == 'P')
       {
-        //osc.set_note_offset(msgIn[3] * 12); // TODO
+        // osc.set_note_offset(msgIn[3] * 12); // TODO
         keyBuffer.apply_key(msgIn[2] + msgIn[3] * 12, true);
         // osc.press_note(msgIn[2]);
       }
@@ -61,6 +159,25 @@ void decodeTask(void *pvParameters)
       {
         keyBuffer.apply_key(msgIn[2] + msgIn[3] * 12, false);
         // osc.release_note(msgIn[2]);
+      }
+      else if (msgIn[0] == 'O')
+      {
+        // when changing the octave
+        sysState.octave.store(sysState.location + msgIn[1]);
+      }
+      else if (msgIn[0] == 'A')
+      {
+        // when there is someone checked that its neighbour left
+        // sent from ends of the boards
+        delay(10);
+        sysState.location.store(autoDetection());
+        sysState.isReceiver.store(sysState.location == 0);
+      }
+      else if (msgIn[0] == 'S')
+      {
+        sysState.song_index.store(msgIn[1]);
+        songs[sysState.song_index].reset();
+        sysState.mode.store(PLAYING);
       }
     }
   }
@@ -85,7 +202,7 @@ void CAN_RX_ISR(void)
   uint32_t id;
   CAN_RX(id, RX_Message_ISR);
   Serial.println("RX :");
-  Serial.println((char) RX_Message_ISR[0]);
+  Serial.println((char)RX_Message_ISR[0]);
   xQueueSendFromISR(msgInQ, RX_Message_ISR, NULL);
 }
 
@@ -232,11 +349,22 @@ public:
   bool update_rotate();
 };
 
-knob knobRotation[4]{
-    knob(KNOB_0_MIN, KNOB_0_MAX, KNOB_A[0], 1),
-    knob(KNOB_1_MIN, KNOB_1_MAX, KNOB_A[1], 1),
-    knob(KNOB_2_MIN, KNOB_2_MAX, KNOB_A[2], 1),
-    knob(KNOB_3_MIN, KNOB_3_MAX, KNOB_A[3], 1)}; // knobs
+knob knobRotation[MAIN_KNOB_NUM][4]{{knob(KNOB_0_MIN, KNOB_0_MAX, KNOB_A[0], 1),
+                                     knob(KNOB_1_MIN, KNOB_1_MAX, KNOB_A[1], 1),
+                                     knob(KNOB_2_MIN, KNOB_2_MAX, KNOB_A[2], 1),
+                                     knob(KNOB_3_MIN, KNOB_3_MAX, KNOB_A[3], 1)},
+                                    {knob(KNOB_0_MIN, 2, KNOB_A[0], 1),
+                                     knob(KNOB_1_MIN, KNOB_1_MAX, KNOB_A[1], 1),
+                                     knob(KNOB_2_MIN, KNOB_2_MAX, KNOB_A[2], 1),
+                                     knob(KNOB_3_MIN, KNOB_3_MAX, KNOB_A[3], 1)},
+                                    {knob(KNOB_0_MIN, 2, KNOB_A[0], 1),
+                                     knob(KNOB_1_MIN, KNOB_1_MAX, KNOB_A[1], 1),
+                                     knob(KNOB_2_MIN, KNOB_2_MAX, KNOB_A[2], 1),
+                                     knob(KNOB_3_MIN, KNOB_3_MAX, KNOB_A[3], 1)},
+                                    {knob(KNOB_0_MIN, 2, KNOB_A[0], 1),
+                                     knob(KNOB_1_MIN, KNOB_1_MAX, KNOB_A[1], 1),
+                                     knob(KNOB_2_MIN, KNOB_2_MAX, KNOB_A[2], 1),
+                                     knob(KNOB_3_MIN, KNOB_3_MAX, KNOB_A[3], 1)}}; // knobs
 
 void send_handshake_signal(int signalW, int signalE)
 {
@@ -257,7 +385,9 @@ void sampleISR()
   // Vout = Vout >> (8 - volume);
   if (sysState.isReceiver.load())
   {
-    analogWrite(OUTR_PIN, (osc.fetch_waveform_height() >> 24));
+    auto vout = (osc.fetch_waveform_height() >> 24) - 128;
+    vout = vout >> (8 - sysState.volume.load());
+    analogWrite(OUTR_PIN, vout + 128);
   }
 }
 
@@ -290,6 +420,98 @@ inline std::bitset<32> readInput()
   }
   return inputsTemp;
 }
+
+void scanJoystickTask(void *pvParameters)
+{
+  const TickType_t xFrequency = 100 / portTICK_PERIOD_MS;
+  int joystickX;
+  int joystickY;
+  int origin = 490;
+  int deadZone = 150;
+  uint8_t prev_state = 0;
+  TickType_t xLastWakeTime = xTaskGetTickCount();
+
+  while (1)
+  {
+    vTaskDelayUntil(&xLastWakeTime, xFrequency);
+    joystickX = analogRead(JOYX_PIN);
+    joystickY = analogRead(JOYY_PIN);
+    if (sysState.mode != PLAYING && sysState.mode != TEACHING)
+    {
+      if (abs(joystickX - origin) <= deadZone && abs(joystickY - origin) <= deadZone)
+      {
+        // nothing changing
+        prev_state = 0;
+        continue;
+      }
+      else if (joystickX - origin > deadZone)
+      {
+        // if top
+        if (prev_state != 1)
+        {
+          uint8_t page_index = (uint8_t)sysState.mode.load();
+          if (page_index <= 2)
+          {
+            sysState.page_column_index[page_index].store((sysState.page_column_index[page_index] - 1) % MAX_COLUMN_NUM[page_index]);
+            if (sysState.mode.load() != NORMAL)
+            {
+              sysState.song_index = sysState.page_column_index[page_index].load();
+            }
+          }
+          prev_state = 1;
+        }
+      }
+      else if (joystickX - origin < -deadZone)
+      {
+        if (prev_state != 2)
+        {
+          uint8_t page_index = (uint8_t)sysState.mode.load();
+          if (page_index <= 2)
+          {
+            sysState.page_column_index[page_index].store((sysState.page_column_index[page_index] + 1) % MAX_COLUMN_NUM[page_index]);
+            if (sysState.mode.load() != NORMAL)
+            {
+              sysState.song_index = sysState.page_column_index[page_index].load();
+            }
+          }
+          prev_state = 2;
+        }
+      }
+      else if (joystickY - origin > deadZone)
+      {
+
+        if (prev_state != 3)
+        {
+          uint8_t page_index = (uint8_t)sysState.mode;
+          if (page_index <= 2)
+          {
+            if (page_index != 0)
+            {
+              sysState.mode.store((EXE_Mode)(page_index - 1));
+            }
+          }
+          prev_state = 3;
+        }
+      }
+      else if (joystickY - origin < -deadZone)
+      {
+        // if up
+        // avoid of overflow
+
+        if (prev_state != 4)
+        {
+          uint8_t page_index = (uint8_t)sysState.mode;
+          if (page_index < 2)
+          {
+            sysState.mode.store((EXE_Mode)(page_index + 1));
+          }
+        }
+        prev_state = 4;
+      }
+    }
+  }
+}
+
 
 // Task to scan keys and update global currentStepSize.
 void scanKeysTask(void *pvParameters)
@@ -327,41 +549,173 @@ void scanKeysTask(void *pvParameters)
         }
       }
     }
-
-    // Within scanKeysTask() — after scanning the key matrix.
-    static std::bitset<32> prevInputs; // static variable to hold the previous key states
-
-    // Example for keys 0 to 11:
-    sysMutexAcquire();
-    std::bitset<32> inputs = sysState.inputs;
-    sysMutexRelease();
-    for (int note = 0; note < 12; note++)
+    else
     {
-      bool currPressed = !inputs[note]; // pressed if logic 0
-      bool prevPressed = prevInputs[note];
-      if (currPressed != prevPressed)
-      { // state changed
-        if (currPressed)
-          TX_Message[0] = 'P';
-        else
-          TX_Message[0] = 'R';
-        TX_Message[1] = 4;    // For example, fixed octave 4
-        TX_Message[2] = note; // Note number
-        TX_Message[3] = sysState.location.load(); // location
-        // Send TX_Message via the transmit queue:
-        xQueueSend(msgOutQ, (void *)TX_Message, portMAX_DELAY);
+      // Within scanKeysTask() — after scanning the key matrix.
+      static std::bitset<32> prevInputs; // static variable to hold the previous key states
+      for (int note = 0; note < 12; note++)
+      {
+        bool currPressed = !inputsTemp[note]; // pressed if logic 0
+        bool prevPressed = prevInputs[note];
+        if (currPressed != prevPressed)
+        { // state changed
+          if (currPressed)
+            TX_Message[0] = 'P';
+          else
+            TX_Message[0] = 'R';
+          TX_Message[1] = 4;                        // For example, fixed octave 4
+          TX_Message[2] = note;                     // Note number
+          TX_Message[3] = sysState.location.load(); // location
+          // Send TX_Message via the transmit queue:
+          xQueueSend(msgOutQ, (void *)TX_Message, portMAX_DELAY);
+        }
+        // Save the current state.
+        prevInputs[note] = currPressed;
       }
-      // Save the current state.
-      prevInputs[note] = currPressed;
     }
-    knobRotation[0].update_rotate();
-    knobRotation[1].update_rotate();
-    knobRotation[2].update_rotate();
-    if (knobRotation[3].update_rotate())
+
+    static std::bitset<1> prev_joy_s;
+    std::bitset<1> current_joy_s = !inputsTemp[22];
+    if (prev_joy_s[0] != current_joy_s[0])
     {
-      int i = (knobRotation[3].read_current());
-      osc.oscillators[0].amplitude.store(0.125f * (float) i);
+      Serial.println("joy s changed");
+      if (current_joy_s[0])
+      {
+        Serial.println("joy s pressed");
+        if (sysState.mode.load() == PLAYING || sysState.mode.load() == TEACHING)
+        {
+          // to remove the key pressed
+          for (int i = 0; i < 10; i++)
+          {
+            osc.articulations[i].note.store(0);
+          }
+          // to clean the song buffer
+          for (int i = 0; i < 8; i++)
+          {
+            songNotes[i] = std::vector<uint8_t>();
+          }
+          sysState.mode.store(NORMAL);
+        }
+        else if (sysState.mode.load() == SELECT_PLAYING_STATE)
+        {
+          songs[sysState.song_index.load()].reset();
+          sysState.mode.store(PLAYING);
+        }
+        else if (sysState.mode.load() == SELECT_TEACHING_STATE)
+        {
+          songs[sysState.song_index.load()].reset();
+          sysState.mode.store(TEACHING);
+        }
+      }
+      prev_joy_s[0] = current_joy_s[0];
     }
+    uint8_t page_column = sysState.page_column_index[1];
+    // knobRotation[page_column][0].update_rotate();
+    // knobRotation[page_column][1].update_rotate();
+    // knobRotation[page_column][2].update_rotate();
+    if (page_column == 0)
+    {
+      if (knobRotation[page_column][0].update_rotate())
+      {
+        int i = (knobRotation[page_column][0].read_current());
+        sysState.volume.store(i);
+      }
+      if (knobRotation[page_column][1].update_rotate())
+      {
+        int i = (knobRotation[page_column][1].read_current());
+        osc.oscillators[0].amplitude.store(0.125f * (float)i);
+      }
+    }
+    else
+    {
+      if (knobRotation[page_column][0].update_rotate())
+      {
+        int i = (knobRotation[page_column][0].read_current());
+        osc.oscillators[page_column - 1].shape.store((WaveShape)i);
+      }
+      if (knobRotation[page_column][1].update_rotate())
+      {
+        int i = (knobRotation[page_column][1].read_current());
+        osc.oscillators[page_column - 1].amplitude.store(0.125f * (float)i);
+      }
+    }
+  }
+}
+
+void drawPiano()
+{
+
+  u8g2.drawFrame(0, 28, 120, 5);
+
+  for (int x = 15; x < 113; x += 17)
+  {
+    if (x != 15 + 17 * 2)
+    {
+      u8g2.drawBox(x, 28, 5, 3);
+    }
+    u8g2.drawVLine(x + 2, 28, 4);
+  }
+}
+
+// for example level 0, with node 1(2 sec away) , 1 level 1/4 second
+void drawNode(uint8_t node, uint8_t level, uint8_t offset)
+{
+  uint8_t height = 4;
+  if (level == 7)
+  {
+    height = offset;
+  }
+  switch (node)
+  {
+  case 0:
+    u8g2.drawBox(1, level * 4 - offset, 16, height);
+    break;
+
+  case 1:
+    u8g2.drawBox(15, level * 4 - offset, 5, height);
+    break;
+
+  case 2:
+    u8g2.drawBox(18, level * 4 - offset, 16, height);
+    break;
+
+  case 3:
+    u8g2.drawBox(32, level * 4 - offset, 5, height);
+    break;
+
+  case 4:
+    u8g2.drawBox(35, level * 4 - offset, 16, height);
+    break;
+
+  case 5:
+    u8g2.drawBox(52, level * 4 - offset, 16, height);
+    break;
+
+  case 6:
+    u8g2.drawBox(66, level * 4 - offset, 5, height);
+    break;
+
+  case 7:
+    u8g2.drawBox(69, level * 4 - offset, 16, height);
+    break;
+
+  case 8:
+    u8g2.drawBox(83, level * 4 - offset, 5, height);
+    break;
+
+  case 9:
+    u8g2.drawBox(86, level * 4 - offset, 16, height);
+    break;
+
+  case 10:
+    u8g2.drawBox(100, level * 4 - offset, 5, height);
+    break;
+
+  case 11:
+    u8g2.drawBox(103, level * 4 - offset, 16, height);
+    break;
+  default:
+    return;
   }
 }
 
@@ -370,126 +724,197 @@ void displayUpdateTask(void *pvParameters)
 {
   const TickType_t xFrequency = 100 / portTICK_PERIOD_MS;
   TickType_t xLastWakeTime = xTaskGetTickCount();
-
+  int i = 0;
   while (1)
   {
-    vTaskDelayUntil(&xLastWakeTime, xFrequency);
+    if (sysState.mode.load() == NORMAL)
+    {
+      vTaskDelayUntil(&xLastWakeTime, xFrequency);
+      u8g2.clearBuffer();
 
-    u8g2.clearBuffer();
-    u8g2.setFont(u8g2_font_ncenB08_tr);
-    // Display current phase step size (read atomically)
-    char buf[12];
-    uint32_t displayStepSize = __atomic_load_n(&currentStepSize, __ATOMIC_RELAXED);
-    sprintf(buf, "%lu", displayStepSize);
-    u8g2.drawStr(2, 10, buf);
-    // Also display lower 12 bits of the key matrix input.
-    u8g2.setCursor(2, 20);
-    sysMutexAcquire();
-    std::bitset<32> inputs = sysState.inputs;
-    sysMutexRelease();
-    u8g2.print(inputs.to_ulong() & 0xFFF, HEX);
-    u8g2.print(" ");
-    u8g2.print(sysState.location.load());
+      u8g2.setFont(u8g2_font_ncenB08_tr);
+      // Display current phase step size (read atomically)
+      char buf[12];
+      uint32_t displayStepSize = __atomic_load_n(&currentStepSize, __ATOMIC_RELAXED);
+      sprintf(buf, "%lu", displayStepSize);
+      u8g2.drawStr(2, 10, buf);
 
-    // no need for set up the mutexes
-    int knob = knobRotation[0].read_current();
-    int knob1 = knobRotation[1].read_current();
-    int knob2 = knobRotation[2].read_current();
-    int knob3 = knobRotation[3].read_current();
+      // Also display lower 12 bits of the key matrix input.
+      u8g2.setCursor(2, 20);
+      sysMutexAcquire();
+      std::bitset<32> inputs = sysState.inputs;
+      sysMutexRelease();
+      u8g2.print(inputs.to_ulong() & 0xFFF, HEX);
+      u8g2.print(" ");
+      u8g2.print(sysState.location.load());
 
-    u8g2.setCursor(2, 30);
-    u8g2.print("0: ");
-    u8g2.print(knob);
+      // no need for set up the mutexes
+      uint8_t col_index = sysState.page_column_index[1];
+      int knob = knobRotation[col_index][0].read_current();
+      int knob1 = knobRotation[col_index][1].read_current();
 
-    u8g2.setCursor(22, 30);
-    u8g2.print("1: ");
-    u8g2.print(knob1);
+      u8g2.setCursor(2, 30);
+      u8g2.print(knob_descript[col_index][0].c_str());
+      u8g2.print(knob);
 
-    u8g2.setCursor(44, 30);
-    u8g2.print("2: ");
-    u8g2.print(knob2);
+      u8g2.setCursor(45, 30);
+      u8g2.print(knob_descript[col_index][1].c_str());
+      u8g2.print(knob1);
 
-    u8g2.setCursor(66, 30);
-    u8g2.print("3: ");
-    u8g2.print(knob3);
+      // Display latest received CAN message.
+      u8g2.setCursor(88, 30);
+      sysMutexAcquireRx();
+      // u8g2.print((char)RX_Message[0]);
+      // u8g2.print(RX_Message[1]);
+      // u8g2.print(RX_Message[2]);
+      sysMutexReleaseRx();
+      u8g2.sendBuffer();
+    }
+    else if (sysState.mode.load() == SELECT_PLAYING_STATE)
+    {
+      vTaskDelayUntil(&xLastWakeTime, xFrequency);
+      u8g2.clearBuffer();
+      u8g2.setCursor(2, 20);
+      u8g2.print(songs[sysState.song_index]._name.c_str());
+      u8g2.setCursor(2, 30);
+      u8g2.print("   play");
+      u8g2.sendBuffer();
+    }
+    else if (sysState.mode.load() == SELECT_TEACHING_STATE)
+    {
+      vTaskDelayUntil(&xLastWakeTime, xFrequency);
+      u8g2.clearBuffer();
+      u8g2.setCursor(2, 20);
+      u8g2.print(songs[sysState.song_index]._name.c_str());
+      u8g2.setCursor(2, 30);
+      u8g2.print("   teach");
+      u8g2.sendBuffer();
+    }
+    else
+    {
+      // change the display to about 28 hertz per second
+      const TickType_t xFrequency_ = 42 / portTICK_PERIOD_MS;
+      vTaskDelayUntil(&xLastWakeTime, xFrequency_);
 
-    // Display latest received CAN message.
-    u8g2.setCursor(88, 30);
-    sysMutexAcquireRx();
-    u8g2.print((char)RX_Message[0]);
-    u8g2.print(RX_Message[1]);
-    u8g2.print(RX_Message[2]);
-    sysMutexReleaseRx();
-    u8g2.sendBuffer();
+      u8g2.clearBuffer();
+
+      int k = songIndex;
+      Serial.println("break");
+      if (i % 4 == 0)
+      {
+        uint8_t old_index = songIndex.load();
+        songIndex.store((old_index + 7) % 8);
+        songNotes[songIndex] = std::move(songs[sysState.song_index.load()].get_next());
+        for (uint8_t x : songNotes[old_index])
+        {
+          Serial.print("get: ");
+          Serial.println(x);
+        }
+
+        // if it is playing update the articulations
+        if (sysState.mode.load() == PLAYING)
+        {
+          int j = 0;
+          for (uint8_t note : songNotes[(songIndex + 7) % 8])
+          {
+            Serial.print("printed: ");
+            Serial.println(note);
+            osc.articulations[j].note.store(note + 1);
+            j++;
+          }
+          for (; j < 10; j++)
+          {
+            osc.articulations[j].note.store(0);
+          }
+        }
+      }
+
+      for (int j = 0; j < 8; j++)
+      {
+
+        for (uint8_t note : songNotes[k])
+        {
+
+          drawNode(note, j, (4 - i % 4) % 4);
+        }
+        // drawNode(j, j, (4 - i % 4) % 4);
+        k++;
+        k = k % 8;
+      }
+
+      drawPiano();
+      i++;
+      i = i % 28;
+      u8g2.sendBuffer();
+    }
 
     digitalToggle(LED_BUILTIN); // Blink LED to indicate timing
   }
 }
 
-uint8_t autoDetection(){
-  uint8_t msgOut[8] = {0};  //message out
-  uint8_t msgIn[8] = {0};  //message in
-  
+uint8_t autoDetection()
+{
+  uint8_t msgOut[8] = {0}; // message out
+  uint8_t msgIn[8] = {0};  // message in
+
   std::bitset<32> inputs;
   std::bitset<1> WestDetect;
   std::bitset<1> EastDetect;
 
-  for(int i = 0; i < 10; i++) {
-    send_handshake_signal(1,1);
+  for (int i = 0; i < 10; i++)
+  {
+    send_handshake_signal(1, 1);
     delayMicroseconds(30000);
   }
-  
 
   inputs = readInput();
   WestDetect[0] = inputs[23];
   EastDetect[0] = inputs[27];
-  
+
+  sysState.east_record.store(EastDetect[0]);
+  sysState.west_record.store(WestDetect[0]);
+
   u8g2.clearBuffer();
   u8g2.setFont(u8g2_font_ncenB08_tr);
   u8g2.setCursor(20, 20);
   u8g2.print("loading");
-  u8g2.print(!WestDetect[0]);
-  u8g2.print(!EastDetect[0]);
   u8g2.sendBuffer();
 
   if (WestDetect[0])
   {
     Serial.println("mainboard");
-    // u8g2.clearBuffer();
-    // u8g2.setFont(u8g2_font_ncenB08_tr);
-    // u8g2.setCursor(20, 20);
-    // u8g2.print("leftmost");
-    // Signal.println(WestDetect[0]);
-    // u8g2.print(EastDetect[0]);
-    // u8g2.sendBuffer();
-    // sysState.location.store(0);
 
-    // if not the only board
-    if(!EastDetect[0]){
+    if (!EastDetect[0])
+    {
       Serial.println("it is not the only board.");
 
       msgOut[0] = 'C';
-      msgOut[1] = 0;    // For example, fixed octave 4
+      msgOut[1] = 0; // For example, fixed octave 4
       // Send TX_Message via the transmit queue:
       CAN_TX(0x123, msgOut);
       Serial.println("submitted C 0 in CAN");
       // delay(200);
       delay(300);
-      for(int i = 0; i < 10; i++){
+      for (int i = 0; i < 10; i++)
+      {
         send_handshake_signal(0, 0);
         delay(30);
       }
       Serial.println("disabled the east west");
       delay(300);
-    } else{
+    }
+    else
+    {
       return 0;
     }
-    while(true){
+    while (true)
+    {
       Serial.println("waiting for finishing");
       uint8_t msgIn[8];
       uint32_t id;
       CAN_RX(id, msgIn);
-      if(msgIn[0] == 'D'){
+      if (msgIn[0] == 'D')
+      {
         break;
       };
       delayMicroseconds(30000);
@@ -498,31 +923,26 @@ uint8_t autoDetection(){
   }
   else
   {
-    // u8g2.clearBuffer();
-    // u8g2.setFont(u8g2_font_ncenB08_tr);
-    // u8g2.setCursor(20, 20);
-    // u8g2.print("middle");
-    // u8g2.print(WestDetect[0]);
-    // u8g2.print(EastDetect[0]);
-    // u8g2.sendBuffer();
-    // sysState.location.store(1);
-    
-    do{
+    do
+    {
       inputs = readInput();
       WestDetect[0] = inputs[23];
       delay(30);
       Serial.println("detecting");
-    } while(!WestDetect[0]);
+    } while (!WestDetect[0]);
     Serial.println("non detecting west");
     uint8_t msgIn[8];
     int id = 0;
     delay(20);
     Serial.println(CAN_CheckRXLevel());
-    while(CAN_CheckRXLevel() > 0){
+    while (CAN_CheckRXLevel() > 0)
+    {
       uint32_t ID;
       CAN_RX(ID, msgIn);
-      if(msgIn[0] == 'C'){
-        if (id < msgIn[1]){
+      if (msgIn[0] == 'C')
+      {
+        if (id < msgIn[1])
+        {
           Serial.println("received C");
           Serial.println(msgIn[1]);
           id = msgIn[1];
@@ -531,36 +951,39 @@ uint8_t autoDetection(){
     }
     uint8_t msgOut[8];
     msgOut[0] = 'C';
-    msgOut[1] = id + 1;    // For example, fixed octave 4
+    msgOut[1] = id + 1; // For example, fixed octave 4
     // Send TX_Message via the transmit queue:
     CAN_TX(0x123, msgOut);
-    if(EastDetect[0]) {
+    if (EastDetect[0])
+    {
       msgOut[0] = 'D';
       CAN_TX(0x123, msgOut);
-      for(int i = 0; i < 10; i++){
+      for (int i = 0; i < 10; i++)
+      {
         send_handshake_signal(0, 0);
         delay(30);
       }
       Serial.println("finished");
       return id + 1;
     }
-    for(int i = 0; i < 10; i++){
+    for (int i = 0; i < 10; i++)
+    {
       send_handshake_signal(0, 0);
       delay(30);
     }
-    while(true){
+    while (true)
+    {
       uint8_t msgIn[8];
       uint32_t id;
       CAN_RX(id, msgIn);
       delayMicroseconds(30000);
-      if(msgIn[0] == 'D'){
+      if (msgIn[0] == 'D')
+      {
         break;
       };
     }
     return id + 1;
   }
-
-  
 }
 
 void loop()
@@ -602,7 +1025,9 @@ void setup()
   // --- CAN bus initialisation ---
   CAN_Init(false);            // Loopback mode for testing
   setCANFilter(0x123, 0x7FF); // Only accept messages with ID 0x123
-  
+  osc.oscillators[0].amplitude = 0.125f;
+  osc.oscillators[1].amplitude = 0.125f;
+  osc.oscillators[2].amplitude = 0.125f;
   // Create counting semaphore for 3 mailbox slots.
   CAN_TX_Semaphore = xSemaphoreCreateCounting(3, 3);
   // Register CAN TX and RX ISRs.
@@ -611,25 +1036,19 @@ void setup()
 
   CAN_Start();
 
-  // u8g2.clearBuffer();
-  // u8g2.setFont(u8g2_font_ncenB08_tr);
-  // u8g2.setCursor(20, 20);
-  // u8g2.print("detecting boards");
-  // u8g2.sendBuffer();
-
   sysState.location.store(autoDetection());
-  send_handshake_signal(1,1);
-  if(sysState.location == 0){
+  send_handshake_signal(1, 1);
+  if (sysState.location == 0)
+  {
     sysState.isReceiver.store(true);
   }
-  
+
   Serial.println("LOCATION:");
   Serial.println(sysState.location);
   // Configure timer to trigger the sampleISR() at 22kHz.
   sampleTimer.setOverflow(22000, HERTZ_FORMAT);
   sampleTimer.attachInterrupt(sampleISR);
   sampleTimer.resume();
-
 
   // Create FreeRTOS tasks.
   TaskHandle_t scanKeysHandle = NULL;
@@ -641,16 +1060,18 @@ void setup()
       1,                /* Task priority */
       &scanKeysHandle); /* Pointer to store the task handle */
 
-  // TaskHandle_t displayHandle = NULL, 1, &displayHandle);
+  // // TaskHandle_t displayHandle = NULL, 1, &displayHandle);
   TaskHandle_t displayHandle = NULL;
   xTaskCreate(displayUpdateTask, "display", 256, NULL, 1, &displayHandle);
-
 
   TaskHandle_t decodeHandle = NULL;
   xTaskCreate(decodeTask, "decode", 128, NULL, 1, &decodeHandle);
 
   TaskHandle_t canTxHandle = NULL;
   xTaskCreate(CAN_TX_Task, "CAN_TX", 128, NULL, 1, &canTxHandle);
+
+  TaskHandle_t joyHandle = NULL;
+  xTaskCreate(scanJoystickTask, "scan_joy_input", 128, NULL, 1, &joyHandle);
 
   // Create a mutex to protect the shared sysState.inputs.
   sysState.mutex = xSemaphoreCreateMutex();

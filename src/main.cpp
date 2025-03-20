@@ -775,7 +775,7 @@ void displayUpdateTask(void *pvParameters)
   int i = 0;
   while (1)
   {
-    if (sysState.mode.load() == NORMAL && sysState.isReceiver())
+    if (sysState.mode.load() == NORMAL && sysState.isReceiver.load())
     {
       #ifndef TEST_DISPLAY
       vTaskDelayUntil(&xLastWakeTime, xFrequency);

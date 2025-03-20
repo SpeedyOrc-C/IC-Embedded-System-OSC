@@ -1118,7 +1118,7 @@ void setup()
   sampleTimer.resume();
 
   // Create FreeRTOS tasks.
-#ifdef DISABLE_THREADSs
+#ifndef DISABLE_THREADS
 
   TaskHandle_t scanKeysHandle = NULL;
   xTaskCreate(

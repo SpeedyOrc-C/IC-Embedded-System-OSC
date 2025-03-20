@@ -151,9 +151,7 @@ void decodeTask(void *pvParameters)
     {
       if (msgIn[0] == 'P')
       {
-        // osc.set_note_offset(msgIn[3] * 12); // TODO
         keyBuffer.apply_key(msgIn[2] + msgIn[3] * 12, true);
-        // osc.press_note(msgIn[2]);
       }
       else if (msgIn[0] == 'R')
       {
@@ -250,9 +248,9 @@ const int KNOB_B[4]{19, 17, 15, 13};
 const int KNOB_0_MIN = 0;
 const int KNOB_0_MAX = 8;
 const int KNOB_1_MIN = 0;
-const int KNOB_1_MAX = 8;
+const int KNOB_1_MAX = 3;
 const int KNOB_2_MIN = 0;
-const int KNOB_2_MAX = 8;
+const int KNOB_2_MAX = 4;
 const int KNOB_3_MIN = 0;
 const int KNOB_3_MAX = 8;
 
@@ -1023,7 +1021,7 @@ void setup()
   Serial.println("Hello World");
 
   // --- CAN bus initialisation ---
-  CAN_Init(false);            // Loopback mode for testing
+  CAN_Init(true);            // Loopback mode for testing
   setCANFilter(0x123, 0x7FF); // Only accept messages with ID 0x123
   osc.oscillators[0].amplitude = 0.125f;
   osc.oscillators[1].amplitude = 0.125f;

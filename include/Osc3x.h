@@ -102,7 +102,7 @@ struct Oscillator
 public:
     std::atomic<WaveShape> shape = TriangularWave;
     std::atomic<float> amplitude = 0.0f;
-    std::atomic<int32_t> note_offset = -12;
+    std::atomic<int32_t> note_offset = 0;
     std::atomic<float> phase_offset = 0.0f;
 };
 

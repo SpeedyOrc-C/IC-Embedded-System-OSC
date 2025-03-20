@@ -268,7 +268,7 @@ void CAN_RX_ISR(void)
   uint8_t RX_Message_ISR[8];
   uint32_t id;
   CAN_RX(id, RX_Message_ISR);
-  #ifndef Disable_CAN_RegisterRX_ISR
+  #if defined(Disable_CAN_RegisterRX_ISR) || !defined(TEST_CAN_RX)
     xQueueSendFromISR(msgInQ, RX_Message_ISR, NULL);
   #endif
 }
@@ -465,7 +465,9 @@ void scanJoystickTask(void *pvParameters)
 
   while (1)
   {
+    #ifndef TEST_JOY_STICK
     vTaskDelayUntil(&xLastWakeTime, xFrequency);
+    #endif
     joystickX = analogRead(JOYX_PIN);
     joystickY = analogRead(JOYY_PIN);
     if (sysState.mode != PLAYING && sysState.mode != TEACHING)
@@ -474,6 +476,9 @@ void scanJoystickTask(void *pvParameters)
       {
         // nothing changing
         prev_state = 0;
+        #ifdef TEST_JOY_STICK
+      break;
+    #endif
         continue;
       }
       else if (joystickX - origin > deadZone)
@@ -541,6 +546,9 @@ void scanJoystickTask(void *pvParameters)
         prev_state = 4;
       }
     }
+    #ifdef TEST_JOY_STICK
+      break;
+    #endif
   }
 }
 
@@ -673,6 +681,9 @@ void scanKeysTask(void *pvParameters)
         osc.oscillators[page_column - 1].amplitude.store(0.125f * (float)i);
       }
     }
+    #ifdef TEST_SCANKEYS
+      break;
+    #endif
   }
 }
 
@@ -774,8 +785,6 @@ void displayUpdateTask(void *pvParameters)
       u8g2.setFont(u8g2_font_ncenB08_tr);
       // Display current phase step size (read atomically)
       char buf[12];
-      uint32_t displayStepSize = __atomic_load_n(&currentStepSize, __ATOMIC_RELAXED);
-      sprintf(buf, "%lu", displayStepSize);
       u8g2.drawStr(2, 10, buf);
 
       // Also display lower 12 bits of the key matrix input.
@@ -1158,40 +1167,26 @@ void setup()
 #ifdef TEST_SAMPLEISR
   runTestIntterupt(sampleISR, "sampleISR");
 #endif
+#ifdef TEST_JOY_STICK
+  runTestThread(scanJoystickTask, "scanJoystickTask");
+#endif
 #ifdef TEST_CAN_TASK
   runTestThread(CAN_TX_Task, "CAN_Task");
 #endif
 #ifdef TEST_CAN_TX
-  runTestIntterupt1(CAN_TX_ISR, "CAN_TX_ISR");
+  runTestIntterupt(CAN_TX_ISR, "CAN_TX_ISR");
 #endif
-#ifdef TEST_CAN_RX
+
+#ifdef TEST_CAN_RX // run with Disable_CAN_RegisterRX_ISR TEST_CAN_TASK
   Serial.print("Running ");
   uint32_t elapsed_tx = 0;
-  uint32_t elapsed_rx = 0;
   uint32_t startTime = 0;
-  // for (int i = 0; i < 32; i++)
-  // {
-    Serial.print("Running1 ");
-    CAN_TX_Task(NULL);
-    xSemaphoreTake(CAN_TX_Semaphore, portMAX_DELAY);
-    startTime = micros();
-    Serial.print("Running2 ");
-    CAN_RX_ISR();
-    elapsed_tx += micros() - startTime;
-    startTime = micros();
-    Serial.print("Running3 ");
-    CAN_TX_ISR();
-    elapsed_rx += micros() - startTime;
-  // }
-  Serial.print("CAN_TX_ISR elapsed time: ");
-  Serial.println(elapsed_tx / 32.0 / 1000, 4); // convert to ms
-  Serial.print("CAN_RX_ISR elapsed time: ");
-  Serial.println(elapsed_rx / 32.0 / 1000, 4); // convert to ms
-
-  
-
-  
-
+  CAN_TX_Task(NULL);
+  startTime = micros();
+  CAN_RX_ISR();
+  elapsed_tx += micros() - startTime;
+  Serial.print("CAN_RX_ISR elapsed time in millisec: ");
+  Serial.println(elapsed_tx, 4);
 #endif
 
   // Start FreeRTOS scheduler.
